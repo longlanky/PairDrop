@@ -302,3 +302,45 @@ receive a text, and check the console for CSP violations.
 2. `engines`/image pinning: base image pinned to `alpine:3.22`; `engines` left untouched (not in scope).
 3. Behaviour defaults: keep-alive interval changed (1 s → 30 s, timeout 90 s); `RATE_LIMIT` default
    unchanged; `trust proxy` now defaults to 1 hop instead of the rate-limit value.
+
+---
+
+# Addendum 2 — P2 backlog (memory, robustness, tooling), 2026-09-20
+
+## Implemented
+
+| # | Item | Change |
+|---|------|--------|
+| 13a | O(n²) base64 encoding | `util.js: arrayBufferToBase64` converts in 32 KB chunks (`String.fromCharCode.apply`) instead of concatenating per byte |
+| 13b | Zip bomb / path traversal | `util.js: decodeBase64Files` caps entries (1000), per-entry and total uncompressed size (2 GB) and strips paths from entry names via `sanitizeZipFilename` |
+| 14 | `RTCPeer._send` | `network.js`: sends only when `channel.readyState === 'open'`, refreshes and drops otherwise, wraps `send` in `try/catch` (no more `InvalidStateError` in the transfer loop) |
+| 15a | Object URL leaks | `ui.js`: `ReceiveFileDialog` tracks preview/zip/download URLs and revokes them when the dialog is hidden; `util.js: getThumbnailAsDataUrl` revokes its URL in a `finally` |
+| 15b | `FileReader` errors | `network.js: FileChunker` handles `error`/`abort` instead of stalling the transfer silently |
+| 15c | IndexedDB churn & silent failures | `persistent-storage.js`: one shared connection (`_getDb`, `_withObjectStore`), `transaction.onerror`/`onabort` and per-request `onerror` reject instead of hanging; `db.onversionchange` closes the connection so another tab can upgrade; the v4→v5 migration now uses the upgrade transaction directly (it previously opened a second connection which is blocked by the very transaction it runs in) |
+| 15d | `BroadcastChannel` | `browser-tabs-connector.js`: closed on `pagehide`; `JSON.parse(localStorage…)` guarded, `removePeerIdFromLocalStorage` tolerates a missing/empty list |
+| 17 | Share target | `service-worker.js`: query built with `URLSearchParams` (values with `&`, `=`, `#` no longer truncate/inject); IndexedDB failures resolve `?share_target=files-error`, surfaced as a notification (new `notifications.share-target-files-error` key in `public/lang/en.json`) |
+| 12 | Workflows / CLI | `zip-release.yml`: `actions/checkout` pinned to a SHA, `.pairdrop-cli-config*` excluded from the zip; `docker-image.yml`: `permissions: contents: read`; `dependabot.yml`: `docker` + `github-actions` ecosystems; `pairdrop-cli/pairdrop`: config parsed line by line with a strict `KEY=value` pattern (no `export "$(grep … | xargs)"`), config written `chmod 600`, temp dir created `mkdir -m 700` |
+| 16 | Dependencies | `npm audit fix` (express 4.22.3 → 0 vulnerabilities), `engines: node >= 18` |
+| — | Docs | `docs/host-your-own.md`: `RATE_LIMIT` documented as enable-flag only, new `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `TRUST_PROXY` and `/healthz` sections; the "find the right hop count" instructions now use `TRUST_PROXY` |
+
+## Verification
+
+- `node --check` for all server/client scripts, `bash -n pairdrop-cli/pairdrop`, `en.json` and `package.json` parse.
+- Config parser exercised with a crafted file: valid `DOMAIN` exported, malformed `INVALID KEY=oops` ignored.
+- Full websocket regression (fuzz, pairing, secret rooms, public rooms, close cleanup, reload) with the new client code and `express@4.22.3`: 0 uncaught exceptions, no ghost peers, `__proto__` room ids rejected.
+- PM2 `PairDrop` on :3000 restarted with the final code: `/` 200, `/healthz` 200.
+
+## Deliberately not changed
+
+- `FileDigester` (`network.js`) still buffers a whole received file in memory to build a `File`.
+  Streaming to disk / a size cap would change UX and needs a product decision.
+- No structured/log-level logging framework was introduced; `console.*` is kept.
+- No test framework was added; verification remains manual (see the repro commands in this file).
+
+## Recommended before release
+
+1. Manual browser pass: pair two devices, send/receive files and text, open a public room,
+   share files/text into the PWA via the OS share target, and check the console for CSP errors.
+2. `docker build` to confirm the non-root user and the reduced build context work in CI.
+3. Rotate the TURN credential in `rtc_config.json` — it was logged in the clear by earlier
+   versions with `DEBUG_MODE=true`.

@@ -68,6 +68,8 @@ specifyDomain()
 {
   [[ ! $1 = http* ]] || [[ ! $1 = */ ]] && echo "Incorrect format. Specify domain like https://pairdrop.net/" && exit
   echo "DOMAIN=${1}" > "$config_path"
+  # the config contains the domain of the instance only, but keep it private anyway
+  chmod 600 "$config_path"
   echo -e "Domain is now set to:\n$1\n"
 }
 
@@ -130,9 +132,11 @@ sendFiles()
   fileCount=0
   pathsPS=""
 
-  #create tmp folder if it does not exist already
+  #create tmp folder if it does not exist already (private: it contains the files to send)
   if [[ ! -d "$tmpDir" ]]; then
-    mkdir "$tmpDir"
+    mkdir -m 700 "$tmpDir"
+  else
+    chmod 700 "$tmpDir" 2>/dev/null
   fi
 
   for arg in "$@"; do
@@ -347,8 +351,19 @@ config_path="${script_path}/.pairdrop-cli-config"
   echo "Could not create config file. Add 'DOMAIN=https://pairdrop.net/' to a file called .pairdrop-cli-config in the same file as this 'pairdrop' bash file (${script_path})" &&
   exit
 
-# Read config variables
-export "$(grep -v '^#' "$config_path" | xargs)"
+# Read config variables.
+# Only `KEY=value` lines are exported. Using `export "$(grep ... | xargs)"` would
+# split values on whitespace and allow to inject arbitrary variables.
+while IFS='=' read -r configKey configValue || [[ -n "$configKey" ]]; do
+  # skip empty lines and comments
+  [[ -z "$configKey" ]] && continue
+  [[ "$configKey" =~ ^[[:space:]]*# ]] && continue
+  # trim whitespace around the key
+  configKey="$(printf '%s' "$configKey" | tr -d '[:space:]')"
+  # only allow valid variable names
+  [[ "$configKey" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+  export "$configKey=$configValue"
+done < "$config_path"
 
 setOs
 

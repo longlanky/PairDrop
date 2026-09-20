@@ -5,6 +5,13 @@ class BrowserTabsConnector {
         this.bc = new BroadcastChannel('pairdrop');
         this.bc.addEventListener('message', e => this._onMessage(e));
         Events.on('broadcast-send', e => this._broadcastSend(e.detail));
+        Events.on('pagehide', _ => this._close());
+    }
+
+    _close() {
+        if (!this.bc) return;
+        this.bc.close();
+        this.bc = null;
     }
 
     _broadcastSend(message) {
@@ -20,21 +27,26 @@ class BrowserTabsConnector {
         }
     }
 
+    static _getPeerIdsBrowser() {
+        // `JSON.parse` throws if localStorage was modified or cleared by another tab
+        try {
+            const peerIdsBrowser = JSON.parse(localStorage.getItem('peer_ids_browser'));
+            return Array.isArray(peerIdsBrowser) ? peerIdsBrowser : [];
+        } catch (e) {
+            console.error('Could not read peer_ids_browser', e);
+            return [];
+        }
+    }
+
     static peerIsSameBrowser(peerId) {
-        let peerIdsBrowser = JSON.parse(localStorage.getItem('peer_ids_browser'));
-        return peerIdsBrowser
-            ? peerIdsBrowser.indexOf(peerId) !== -1
-            : false;
+        return this._getPeerIdsBrowser().indexOf(peerId) !== -1;
     }
 
     static async addPeerIdToLocalStorage() {
         const peerId = sessionStorage.getItem('peer_id');
         if (!peerId) return false;
 
-        let peerIdsBrowser = [];
-        let peerIdsBrowserOld = JSON.parse(localStorage.getItem('peer_ids_browser'));
-
-        if (peerIdsBrowserOld) peerIdsBrowser.push(...peerIdsBrowserOld);
+        let peerIdsBrowser = this._getPeerIdsBrowser();
         peerIdsBrowser.push(peerId);
         peerIdsBrowser = peerIdsBrowser.filter(onlyUnique);
         localStorage.setItem('peer_ids_browser', JSON.stringify(peerIdsBrowser));
@@ -43,9 +55,9 @@ class BrowserTabsConnector {
     }
 
     static async removePeerIdFromLocalStorage(peerId) {
-        let peerIdsBrowser = JSON.parse(localStorage.getItem('peer_ids_browser'));
+        let peerIdsBrowser = this._getPeerIdsBrowser();
         const index = peerIdsBrowser.indexOf(peerId);
-        peerIdsBrowser.splice(index, 1);
+        if (index > -1) peerIdsBrowser.splice(index, 1);
         localStorage.setItem('peer_ids_browser', JSON.stringify(peerIdsBrowser));
         return peerId;
     }

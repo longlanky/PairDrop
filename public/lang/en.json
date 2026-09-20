@@ -122,6 +122,7 @@
         "faq_title": "Frequently asked questions"
     },
     "notifications": {
+        "share-target-files-error": "Shared files could not be saved. Please share them again.",
         "display-name-changed-permanently": "Display name is changed permanently",
         "display-name-changed-temporarily": "Display name is changed for this session only",
         "display-name-random-again": "Display name is randomly generated again",

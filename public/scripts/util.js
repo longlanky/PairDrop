@@ -451,11 +451,16 @@ function changeFavicon(src) {
 }
 
 function arrayBufferToBase64(buffer) {
+    // Concatenating one character at a time is O(n^2) and freezes the ui for
+    // larger files. Convert in chunks instead.
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 0x8000; // 32 KB
     let binary = '';
-    let bytes = new Uint8Array(buffer);
-    let len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(
+            null,
+            bytes.subarray(i, i + chunkSize)
+        );
     }
     return window.btoa( binary );
 }
@@ -476,6 +481,7 @@ async function fileToBlob (file) {
 
 function getThumbnailAsDataUrl(file, width = undefined, height = undefined, quality = 0.7) {
     return new Promise(async (resolve, reject) => {
+        let imageUrl;
         try {
             if (file.type === "image/heif" || file.type === "image/heic") {
                 // hotfix: Converting heic images taken on iOS 18 crashes page. Waiting for PR #350
@@ -490,7 +496,7 @@ function getThumbnailAsDataUrl(file, width = undefined, height = undefined, qual
                 // });
             }
 
-            let imageUrl = URL.createObjectURL(file);
+            imageUrl = URL.createObjectURL(file);
 
             let image = new Image();
             image.src = imageUrl;
@@ -527,6 +533,9 @@ function getThumbnailAsDataUrl(file, width = undefined, height = undefined, qual
         } catch (e) {
             console.error(e);
             reject(new Error(`Could not create an image thumbnail from type ${file.type}`));
+        } finally {
+            // free the memory of the created object url
+            if (imageUrl) URL.revokeObjectURL(imageUrl);
         }
     })
 }
@@ -564,6 +573,21 @@ function waitUntilImageIsLoaded(imageUrl, timeout = 10000) {
     });
 }
 
+// Guards against zip bombs and against entries that escape the download directory
+const MAX_ZIP_ENTRIES = 1000;
+const MAX_ZIP_TOTAL_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB uncompressed
+const MAX_ZIP_ENTRY_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB uncompressed
+
+function sanitizeZipFilename(filename) {
+    // strip any path information (`../`, absolute paths, windows drive letters)
+    const name = String(filename ?? '')
+        .replace(/\\/g, '/')
+        .split('/')
+        .filter(part => !!part && part !== '.' && part !== '..')
+        .pop();
+    return name || 'file';
+}
+
 async function decodeBase64Files(base64) {
     if (!base64) throw new Error('Base64 is empty');
 
@@ -576,9 +600,27 @@ async function decodeBase64Files(base64) {
 
     let files = [];
     const zipEntries = await zipper.getEntries(zipBlob);
+
+    if (zipEntries.length > MAX_ZIP_ENTRIES) {
+        throw new Error(`Too many files in archive (${zipEntries.length} > ${MAX_ZIP_ENTRIES})`);
+    }
+
+    let totalBytes = 0;
     for (let i = 0; i < zipEntries.length; i++) {
-        let fileBlob = await zipper.getData(zipEntries[i]);
-        files.push(new File([fileBlob], zipEntries[i].filename));
+        const entry = zipEntries[i];
+        const entrySize = entry.uncompressedSize ?? 0;
+
+        if (entrySize > MAX_ZIP_ENTRY_BYTES) {
+            throw new Error(`File in archive is too large (${entrySize} bytes)`);
+        }
+
+        totalBytes += entrySize;
+        if (totalBytes > MAX_ZIP_TOTAL_BYTES) {
+            throw new Error(`Archive is too large (${totalBytes} bytes)`);
+        }
+
+        const fileBlob = await zipper.getData(entry);
+        files.push(new File([fileBlob], sanitizeZipFilename(entry.filename)));
     }
     return files
 }

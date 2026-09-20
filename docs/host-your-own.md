@@ -134,6 +134,7 @@ services:
             - PGID=1000 # GID to run the application as
             - WS_FALLBACK=false # Set to true to enable websocket fallback if the peer to peer WebRTC connection is not available to the client.
             - RATE_LIMIT=false # Set to true to limit clients to 1000 requests per 5 min.
+            - TRUST_PROXY=1 # Number of reverse proxy hops that are trusted to determine the client ip. Use false if the instance is not behind a reverse proxy.
             - RTC_CONFIG=false # Set to the path of a file that specifies the STUN/TURN servers.
             - DEBUG_MODE=false # Set to true to debug container and peer connections.
             - TZ=Etc/UTC # Time Zone
@@ -219,7 +220,7 @@ npm start -- --auto-restart
 npm run start:prod
 ```
 
-> shortcut for `RATE_LIMIT=5 npm start -- --auto-restart`
+> shortcut for `RATE_LIMIT=true npm start -- --auto-restart`
 
 #### Production (autostart, rate-limit, localhost-only)
 
@@ -294,12 +295,12 @@ DEBUG_MODE="true"
 ### Rate limiting requests
 
 ```bash
-RATE_LIMIT=1
+RATE_LIMIT=true
 ```
 
 > Default: `false`
 >
-> Limits clients to 1000 requests per 5 min
+> Limits clients to `RATE_LIMIT_MAX` requests per `RATE_LIMIT_WINDOW_MS` (1000 requests per 5 min by default).
 >
 > "If you are behind a proxy/load balancer (usually the case with most hosting services, e.g. Heroku, Bluemix, AWS ELB,
 > Render, Nginx, Cloudflare, Akamai, Fastly, Firebase Hosting, Rackspace LB, Riverbed Stingray, etc.), the IP address of
@@ -307,14 +308,54 @@ RATE_LIMIT=1
 > blocking all requests once the limit is reached) or undefined."
 > (See: https://express-rate-limit.mintlify.app/guides/troubleshooting-proxy-issues)
 >
+> Use `TRUST_PROXY` to specify how many proxy hops PairDrop has to look past to determine the IP address of the client.
+
+<br>
+
+### Maximum number of requests within the rate limit window
+
+```bash
+RATE_LIMIT_MAX=1000
+RATE_LIMIT_WINDOW_MS=300000
+```
+
+> Default: `1000` requests per `300000` ms (5 min)
+>
+> Only used if `RATE_LIMIT` is enabled.
+
+<br>
+
+### Number of trusted reverse proxy hops
+
+```bash
+TRUST_PROXY=1
+```
+
+> Default: `1` if `RATE_LIMIT` is enabled, `false` otherwise
+>
+> Number of reverse proxy hops that are trusted to determine the IP address of the client.
+>
 > To find the correct number to use for this setting:
 >
-> 1. Start PairDrop with `DEBUG_MODE=True` and `RATE_LIMIT=1`
+> 1. Start PairDrop with `DEBUG_MODE=True`, `RATE_LIMIT=true` and `TRUST_PROXY=1`
 > 2. Make a `get` request to `/ip` of the PairDrop instance (e.g. `https://pairdrop-example.net/ip`)
 > 3. Check if the IP address returned in the response matches your public IP address (find out by visiting e.g. https://whatsmyip.com/)
-> 4. You have found the correct number if the IP addresses match. If not, then increase `RATE_LIMIT` by one and redo 1. - 4.
+> 4. You have found the correct number if the IP addresses match. If not, then increase `TRUST_PROXY` by one and redo 1. - 4.
 >
-> e.g. on Render you must use RATE_LIMIT=5
+> e.g. on Render you must use TRUST_PROXY=5
+>
+> If your instance is not behind a reverse proxy, set `TRUST_PROXY=false`. Otherwise a client can spoof its IP address
+> via the `X-Forwarded-For` header and thereby bypass the rate limit.
+>
+> The reverse proxy has to **append** to `X-Forwarded-For`
+> (e.g. `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` in nginx).
+
+<br>
+
+### Health check
+
+> `GET /healthz` returns `200 ok` and is not rate limited.
+> Use it for container health checks and monitoring instead of the index page.
 
 
 <br>

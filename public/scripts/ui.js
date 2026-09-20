@@ -896,6 +896,20 @@ class ReceiveFileDialog extends ReceiveDialog {
 
         Events.on('files-received', e => this._onFilesReceived(e.detail.peerId, e.detail.files, e.detail.imagesOnly, e.detail.totalSize));
         this._filesQueue = [];
+        // object urls of previews and downloads. They are revoked once the dialog is hidden
+        this._objectUrls = [];
+    }
+
+    _createObjectUrl(blob) {
+        const url = URL.createObjectURL(blob);
+        this._objectUrls.push(url);
+        return url;
+    }
+
+    _revokeObjectUrls() {
+        while (this._objectUrls.length) {
+            URL.revokeObjectURL(this._objectUrls.pop());
+        }
     }
 
     async _onFilesReceived(peerId, files, imagesOnly, totalSize) {
@@ -952,7 +966,7 @@ class ReceiveFileDialog extends ReceiveDialog {
                     element.onerror = _ => {
                         reject(`${mime} preview could not be loaded from type ${file.type}`);
                     };
-                    element.src = URL.createObjectURL(file);
+                    element.src = this._createObjectUrl(file);
                 }
             } catch (e) {
                 reject(`preview could not be loaded from type ${file.type}`);
@@ -1006,6 +1020,7 @@ class ReceiveFileDialog extends ReceiveDialog {
                     bytesCompleted += files[i].size;
                 }
                 url = await zipper.getBlobURL();
+                this._objectUrls.push(url);
 
                 let now = new Date(Date.now());
                 let year = now.getFullYear().toString();
@@ -1080,8 +1095,9 @@ class ReceiveFileDialog extends ReceiveDialog {
     _downloadFilesIndividually(files) {
         let tmpBtn = document.createElement("a");
         for (let i=0; i<files.length; i++) {
+            const url = this._createObjectUrl(files[i]);
             tmpBtn.download = files[i].name;
-            tmpBtn.href = URL.createObjectURL(files[i]);
+            tmpBtn.href = url;
             tmpBtn.click();
         }
     }
@@ -1092,6 +1108,8 @@ class ReceiveFileDialog extends ReceiveDialog {
             this.$shareBtn.setAttribute('hidden', true);
             this.$downloadBtn.setAttribute('disabled', true);
             this.$previewBox.innerHTML = '';
+            // free the memory of previews and downloaded files
+            this._revokeObjectUrls();
             this._busy = false;
             await this._nextFiles();
         }, 300);
@@ -2676,15 +2694,29 @@ class WebShareTargetUI {
                 Events.fire('activate-share-mode', {text: shareTargetText});
             }
         }
-        else if (shareTargetType === "files") {
+        else if (shareTargetType === "files" || shareTargetType === "files-error") {
             let openRequest = window.indexedDB.open('pairdrop_store')
+            openRequest.onerror = e => {
+                console.error("Could not open database to retrieve shared files", e);
+                Events.fire('notify-user', Localization.getTranslation("notifications.share-target-files-error"));
+            }
             openRequest.onsuccess = e => {
                 const db = e.target.result;
                 const tx = db.transaction('share_target_files', 'readwrite');
                 const store = tx.objectStore('share_target_files');
                 const request = store.getAll();
+                request.onerror = e => {
+                    console.error("Could not retrieve shared files", e);
+                    Events.fire('notify-user', Localization.getTranslation("notifications.share-target-files-error"));
+                }
                 request.onsuccess = _ => {
                     const fileObjects = request.result;
+
+                    if (shareTargetType === "files-error" || !fileObjects.length) {
+                        // the service worker could not save the shared files
+                        Events.fire('notify-user', Localization.getTranslation("notifications.share-target-files-error"));
+                        return;
+                    }
 
                     let filesReceived = [];
                     for (let i = 0; i < fileObjects.length; i++) {

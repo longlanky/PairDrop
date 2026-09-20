@@ -239,20 +239,29 @@ const evaluateRequestData = function (request) {
                     objectStoreRequest.onsuccess = _ => {
                         if (i === fileObjects.length - 1) resolve(pairDropUrl + '?share_target=files');
                     }
+                    // Without this the user is redirected to PairDrop without any
+                    // files and without any hint that the share failed.
+                    objectStoreRequest.onerror = e => {
+                        console.error("Could not save shared file", e);
+                        resolve(pairDropUrl + '?share_target=files-error');
+                    }
                 }
             }
-            DBOpenRequest.onerror = _ => {
-                resolve(pairDropUrl);
+            DBOpenRequest.onerror = e => {
+                console.error("Could not open database to save shared files", e);
+                resolve(pairDropUrl + '?share_target=files-error');
             }
         }
         else {
-            let urlArgument = '?share_target=text';
+            // use `URLSearchParams` so that values containing `&`, `=`, `#` or
+            // whitespace cannot truncate or inject additional arguments
+            const searchParams = new URLSearchParams();
+            searchParams.set('share_target', 'text');
+            if (title) searchParams.set('title', title);
+            if (text) searchParams.set('text', text);
+            if (url) searchParams.set('url', url);
 
-            if (title) urlArgument += `&title=${title}`;
-            if (text) urlArgument += `&text=${text}`;
-            if (url) urlArgument += `&url=${url}`;
-
-            resolve(pairDropUrl + urlArgument);
+            resolve(`${pairDropUrl}?${searchParams.toString()}`);
         }
     });
 }

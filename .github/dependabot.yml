@@ -9,3 +9,11 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+  - package-ecosystem: "docker" # Keep the base image of the Dockerfile up to date
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions" # Keep pinned action SHAs up to date
+    directory: "/"
+    schedule:
+      interval: "weekly"

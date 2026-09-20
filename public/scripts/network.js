@@ -926,8 +926,20 @@ class RTCPeer extends Peer {
     }
 
     _send(message) {
-        if (!this._channel) this.refresh();
-        this._channel.send(message);
+        if (!this._channel || this._channel.readyState !== 'open') {
+            // The channel is not ready. Reconnect and drop the message instead of
+            // throwing `InvalidStateError` which would abort the transfer loop.
+            this.refresh();
+            console.warn('RTC: channel is not open. Message dropped', this._peerId);
+            return;
+        }
+
+        try {
+            this._channel.send(message);
+        } catch (e) {
+            console.error('RTC: could not send message', e);
+            this._onError(e);
+        }
     }
 
     _sendSignal(signal) {
@@ -1269,6 +1281,13 @@ class FileChunker {
         this._onPartitionEnd = onPartitionEnd;
         this._reader = new FileReader();
         this._reader.addEventListener('load', e => this._onChunkRead(e.target.result));
+        // without these handlers a failing read stalls the transfer silently
+        this._reader.addEventListener('error', e => this._onChunkError(e));
+        this._reader.addEventListener('abort', e => this._onChunkError(e));
+    }
+
+    _onChunkError(e) {
+        console.error('FileChunker: could not read chunk', e);
     }
 
     nextPartition() {
