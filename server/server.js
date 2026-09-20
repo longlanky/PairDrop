@@ -44,6 +44,14 @@ export default class PairDropServer {
 
         app.use(compression());
 
+        // ensure correct client ip and not the ip of the reverse proxy is used
+        // see https://express-rate-limit.mintlify.app/guides/troubleshooting-proxy-issues
+        // `TRUST_PROXY` unset: default to 1 hop when rate limiting is active, else no trust
+        const trustProxy = conf.trustProxy !== undefined
+            ? conf.trustProxy
+            : (conf.rateLimit ? 1 : false);
+        app.set('trust proxy', trustProxy);
+
         if (conf.rateLimit) {
             const limiter = RateLimit({
                 windowMs: conf.rateLimitWindowMs || 5 * 60 * 1000, // 5 minutes by default
@@ -52,10 +60,6 @@ export default class PairDropServer {
                 standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
                 legacyHeaders: false, // Disable the `X-RateLimit-*` headers
             })
-
-            // ensure correct client ip and not the ip of the reverse proxy is used for rate limiting
-            // see https://express-rate-limit.mintlify.app/guides/troubleshooting-proxy-issues
-            app.set('trust proxy', conf.trustProxy);
 
             app.use(limiter);
 

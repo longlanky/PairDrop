@@ -153,6 +153,7 @@ class PeersUI {
         // Remove peer from UI
         const $peer = $(peerId);
         if (!$peer) return;
+        if ($peer.ui && $peer.ui._destroy) $peer.ui._destroy();
         $peer.remove();
         this._evaluateOverflowingPeers();
 
@@ -186,7 +187,9 @@ class PeersUI {
 
         this._onDragEnd();
 
-        if ($$('x-peer') && $$('x-peer').contains(e.target)) return; // dropped on peer
+        // `$$('x-peer')` only returns the first peer node: use closest to check
+        // whether the drop happened on any peer (PeerUI handles those drops)
+        if (e.target.closest('x-peer')) return; // dropped on peer
 
         let files = e.dataTransfer.files;
         let text = e.dataTransfer.getData("text");
@@ -423,10 +426,18 @@ class PeerUI {
         Events.fire('peer-added');
 
         // ShareMode
-        Events.on('share-mode-changed', e => this._onShareModeChanged(e.detail.active, e.detail.descriptor));
+        // keep a stable reference so the listener can be removed when the peer is destroyed
+        this._shareModeChangedHandler = e => this._onShareModeChanged(e.detail.active, e.detail.descriptor);
+        Events.on('share-mode-changed', this._shareModeChangedHandler);
 
         // Stop background animation
         Events.fire('background-animation', {animate: false});
+    }
+
+    _destroy() {
+        // unregister window listeners: they would keep this PeerUI (and its
+        // detached DOM nodes) alive after the peer was removed
+        Events.off('share-mode-changed', this._shareModeChangedHandler);
     }
 
     html() {
@@ -1471,7 +1482,7 @@ class PairDeviceDialog extends Dialog {
     }
 
     _evaluateJoinedPeer(peerId, roomType, roomId) {
-        const noPairPeerSaved = !Object.keys(this.pairPeer);
+        const noPairPeerSaved = Object.keys(this.pairPeer).length === 0;
 
         if (!peerId || !roomType || !roomId || noPairPeerSaved) return;
 
@@ -1582,10 +1593,20 @@ class EditPairedDevicesDialog extends Dialog {
     }
 
     async _initDOM() {
+        // guard against interleaved runs (e.g. double click): only the newest
+        // run may populate the wrapper, older runs would duplicate the entries
+        const token = this._initDOMToken = (this._initDOMToken || 0) + 1;
+
+        // clear synchronously on open: a deferred clear from hide() could otherwise
+        // wipe the freshly rendered list when the dialog is reopened quickly
+        this.$pairedDevicesWrapper.innerHTML = "";
+
         const pairedDeviceRemovedString = Localization.getTranslation("dialogs.paired-device-removed");
         const unpairString = Localization.getTranslation("dialogs.unpair").toUpperCase();
         const autoAcceptString = Localization.getTranslation("dialogs.auto-accept").toLowerCase();
         const roomSecretsEntries = await PersistentStorage.getAllRoomSecretEntries();
+
+        if (token !== this._initDOMToken) return;
 
         roomSecretsEntries
             .forEach(roomSecretsEntry => {
@@ -1648,13 +1669,6 @@ class EditPairedDevicesDialog extends Dialog {
 
                 this.$pairedDevicesWrapper.appendChild($pairedDevice)
             })
-    }
-
-    hide() {
-        super.hide();
-        setTimeout(() => {
-            this.$pairedDevicesWrapper.innerHTML = ""
-        }, 300);
     }
 
     _onEditPairedDevices() {
@@ -2339,7 +2353,9 @@ class Base64Dialog extends Dialog {
         if (navigator.clipboard.readText) {
             this.$pasteBtn.innerText = Localization.getTranslation("dialogs.base64-tap-to-paste", null, {type: translateType});
             this._clickCallback = _ => this.processClipboard(type);
-            this.$pasteBtn.addEventListener('click', _ => this._clickCallback());
+            // keep a stable reference so hide() can actually remove the listener
+            this._clickHandler = _ => this._clickCallback();
+            this.$pasteBtn.addEventListener('click', this._clickHandler);
         }
         else {
             console.log("`navigator.clipboard.readText()` is not available on your browser.\nOn Firefox you can set `dom.events.asyncClipboard.readText` to true under `about:config` for convenience.")
@@ -2347,7 +2363,9 @@ class Base64Dialog extends Dialog {
             this.$fallbackTextarea.setAttribute('placeholder', Localization.getTranslation("dialogs.base64-paste-to-send", null, {type: translateType}));
             this.$fallbackTextarea.removeAttribute('hidden');
             this._inputCallback = _ => this.processInput(type);
-            this.$fallbackTextarea.addEventListener('input', _ => this._inputCallback());
+            // keep a stable reference so hide() can actually remove the listener
+            this._inputHandler = _ => this._inputCallback();
+            this.$fallbackTextarea.addEventListener('input', this._inputHandler);
             this.$fallbackTextarea.focus();
         }
     }
@@ -2415,8 +2433,15 @@ class Base64Dialog extends Dialog {
     }
 
     hide() {
-        this.$pasteBtn.removeEventListener('click', _ => this._clickCallback());
-        this.$fallbackTextarea.removeEventListener('input', _ => this._inputCallback());
+        // remove the listeners via the same references that were used to add them
+        if (this._clickHandler) {
+            this.$pasteBtn.removeEventListener('click', this._clickHandler);
+            this._clickHandler = null;
+        }
+        if (this._inputHandler) {
+            this.$fallbackTextarea.removeEventListener('input', this._inputHandler);
+            this._inputHandler = null;
+        }
         this.$fallbackTextarea.setAttribute('disabled', true);
         this.$fallbackTextarea.blur();
         super.hide();
@@ -2508,6 +2533,11 @@ class Notifications {
 
         this.$headerNotificationButton.addEventListener('click', _ => this._requestPermission());
 
+        // One router for all service worker notifications: adding a listener per
+        // notification would fire every past handler whenever any notification is clicked
+        this._swClickHandlers = {};
+        this._swClickRouterRegistered = false;
+        this._notificationCounter = 0;
 
         Events.on('text-received', e => this._messageNotification(e.detail.text, e.detail.peerId));
         Events.on('files-received', e => this._downloadNotification(e.detail.files));
@@ -2526,128 +2556,165 @@ class Notifications {
             });
     }
 
-    _notify(title, body) {
+    _registerSwClickRouter() {
+        if (this._swClickRouterRegistered) return;
+        this._swClickRouterRegistered = true;
+
+        serviceWorker.addEventListener('notificationclick', e => {
+            const tag = e.notification.tag;
+            const handler = this._swClickHandlers[tag];
+            if (tag) delete this._swClickHandlers[tag];
+            e.notification.close();
+            if (handler) handler(e, _ => e.notification.close());
+        });
+    }
+
+    // `onClick` is called as `onClick(event, close)` where `close` closes this notification.
+    // Works on both the native path and the service worker path (Android), where
+    // `showNotification()` returns a promise that resolves to `undefined`.
+    _notify(title, body, onClick) {
         const config = {
             body: body,
             icon: '/images/logo_transparent_128x128.png',
-        }
-        let notification;
+        };
+
+        let notification = null;
+        let tag = null;
+
+        const close = _ => {
+            if (notification) {
+                notification.close();
+                return;
+            }
+            if (!tag || !serviceWorker || !serviceWorker.getNotifications) return;
+            delete this._swClickHandlers[tag];
+            serviceWorker
+                .getNotifications()
+                .then(notifications => {
+                    notifications.forEach(n => {
+                        if (n.tag === tag) n.close();
+                    });
+                })
+                .catch(e => console.error(e));
+        };
+
         try {
             notification = new Notification(title, config);
+            if (onClick) notification.onclick = e => onClick(e, close);
         } catch (e) {
             // Android doesn't support "new Notification" if service worker is installed
-            if (!serviceWorker || !serviceWorker.showNotification) return;
-            notification = serviceWorker.showNotification(title, config);
+            if (!serviceWorker || !serviceWorker.showNotification) return null;
+
+            tag = `pairdrop-notification-${++this._notificationCounter}`;
+            config.tag = tag;
+            if (onClick) this._swClickHandlers[tag] = onClick;
+            this._registerSwClickRouter();
+
+            serviceWorker.showNotification(title, config)
+                .catch(err => console.error(err));
         }
 
         // Notification is persistent on Android. We have to close it manually
         const visibilitychangeHandler = () => {
-            if (document.visibilityState === 'visible') {
-                notification.close();
-                Events.off('visibilitychange', visibilitychangeHandler);
-            }
+            if (document.visibilityState !== 'visible') return;
+            close();
+            Events.off('visibilitychange', visibilitychangeHandler);
         };
         Events.on('visibilitychange', visibilitychangeHandler);
 
-        return notification;
+        return close;
     }
 
     _messageNotification(message, peerId) {
-        if (document.visibilityState !== 'visible') {
-            const peerDisplayName = $(peerId).ui._displayName();
-            if (/^((https?:\/\/|www)[abcdefghijklmnopqrstuvwxyz0123456789\-._~:\/?#\[\]@!$&'()*+,;=]+)$/.test(message.toLowerCase())) {
-                const notification = this._notify(Localization.getTranslation("notifications.link-received", null, {name: peerDisplayName}), message);
-                this._bind(notification, _ => window.open(message, '_blank', "noreferrer"));
-            }
-            else {
-                const notification = this._notify(Localization.getTranslation("notifications.message-received", null, {name: peerDisplayName}), message);
-                this._bind(notification, _ => this._copyText(message, notification));
-            }
+        if (document.visibilityState === 'visible') return;
+
+        const $peer = $(peerId);
+        if (!$peer) return;
+        const peerDisplayName = $peer.ui._displayName();
+
+        if (/^((https?:\/\/|www)[abcdefghijklmnopqrstuvwxyz0123456789\-._~:\/?#\[\]@!$&'()*+,;=]+)$/.test(message.toLowerCase())) {
+            this._notify(Localization.getTranslation("notifications.link-received", null, {name: peerDisplayName}), message,
+                _ => window.open(message, '_blank', "noreferrer"));
+        }
+        else {
+            this._notify(Localization.getTranslation("notifications.message-received", null, {name: peerDisplayName}), message,
+                (_e, close) => this._copyText(message, close));
         }
     }
 
     _downloadNotification(files) {
-        if (document.visibilityState !== 'visible') {
-            let imagesOnly = files.every(file => file.type.split('/')[0] === 'image');
-            let title;
+        if (document.visibilityState === 'visible') return;
 
-            if (files.length === 1) {
-                title = `${files[0].name}`;
+        let imagesOnly = files.every(file => file.type.split('/')[0] === 'image');
+        let title;
+
+        if (files.length === 1) {
+            title = `${files[0].name}`;
+        }
+        else {
+            let fileOther;
+            if (files.length === 2) {
+                fileOther = imagesOnly
+                    ? Localization.getTranslation("dialogs.file-other-description-image")
+                    : Localization.getTranslation("dialogs.file-other-description-file");
             }
             else {
-                let fileOther;
-                if (files.length === 2) {
-                    fileOther = imagesOnly
-                        ? Localization.getTranslation("dialogs.file-other-description-image")
-                        : Localization.getTranslation("dialogs.file-other-description-file");
-                }
-                else {
-                    fileOther = imagesOnly
-                        ? Localization.getTranslation("dialogs.file-other-description-image-plural", null, {count: files.length - 1})
-                        : Localization.getTranslation("dialogs.file-other-description-file-plural", null, {count: files.length - 1});
-                }
-                title = `${files[0].name} ${fileOther}`
+                fileOther = imagesOnly
+                    ? Localization.getTranslation("dialogs.file-other-description-image-plural", null, {count: files.length - 1})
+                    : Localization.getTranslation("dialogs.file-other-description-file-plural", null, {count: files.length - 1});
             }
-            const notification = this._notify(title, Localization.getTranslation("notifications.click-to-download"));
-            this._bind(notification, _ => this._download(notification));
+            title = `${files[0].name} ${fileOther}`
         }
+        this._notify(title, Localization.getTranslation("notifications.click-to-download"),
+            (_e, close) => this._download(close));
     }
 
     _requestNotification(request, peerId) {
-        if (document.visibilityState !== 'visible') {
-            let imagesOnly = request.header.every(header => header.mime.split('/')[0] === 'image');
-            let displayName = $(peerId).querySelector('.name').textContent;
+        if (document.visibilityState === 'visible') return;
 
-            let descriptor;
-            if (request.header.length === 1) {
-                descriptor = imagesOnly
-                    ? Localization.getTranslation("dialogs.title-image")
-                    : Localization.getTranslation("dialogs.title-file");
-            }
-            else {
-                descriptor = imagesOnly
-                    ? Localization.getTranslation("dialogs.title-image-plural")
-                    : Localization.getTranslation("dialogs.title-file-plural");
-            }
+        const $peer = $(peerId);
+        if (!$peer) return;
 
-            let title = Localization
-                .getTranslation("notifications.request-title", null, {
-                    name: displayName,
-                    count: request.header.length,
-                    descriptor: descriptor.toLowerCase()
-                });
+        let imagesOnly = request.header.every(header => header.mime.split('/')[0] === 'image');
+        let displayName = $peer.querySelector('.name').textContent;
 
-            const notification = this._notify(title, Localization.getTranslation("notifications.click-to-show"));
+        let descriptor;
+        if (request.header.length === 1) {
+            descriptor = imagesOnly
+                ? Localization.getTranslation("dialogs.title-image")
+                : Localization.getTranslation("dialogs.title-file");
         }
+        else {
+            descriptor = imagesOnly
+                ? Localization.getTranslation("dialogs.title-image-plural")
+                : Localization.getTranslation("dialogs.title-file-plural");
+        }
+
+        let title = Localization
+            .getTranslation("notifications.request-title", null, {
+                name: displayName,
+                count: request.header.length,
+                descriptor: descriptor.toLowerCase()
+            });
+
+        this._notify(title, Localization.getTranslation("notifications.click-to-show"));
     }
 
-    _download(notification) {
+    _download(close) {
         this.$downloadBtn.click();
-        notification.close();
+        if (close) close();
     }
 
-    async _copyText(message, notification) {
-        if (await navigator.clipboard.writeText(message)) {
-            notification.close();
+    async _copyText(message, close) {
+        // `writeText` resolves to undefined: success is a resolved promise, not a truthy value
+        try {
+            await navigator.clipboard.writeText(message);
+            if (close) close();
             this._notify(Localization.getTranslation("notifications.copied-text"));
         }
-        else {
+        catch (e) {
+            console.error(e);
             this._notify(Localization.getTranslation("notifications.copied-text-error"));
-        }
-    }
-
-    _bind(notification, handler) {
-        if (notification.then) {
-            notification.then(_ => {
-                serviceWorker
-                    .getNotifications()
-                    .then(_ => {
-                        serviceWorker.addEventListener('notificationclick', handler);
-                    })
-            });
-        }
-        else {
-            notification.onclick = handler;
         }
     }
 }
@@ -2702,18 +2769,34 @@ class WebShareTargetUI {
             }
             openRequest.onsuccess = e => {
                 const db = e.target.result;
-                const tx = db.transaction('share_target_files', 'readwrite');
+
+                let tx;
+                try {
+                    tx = db.transaction('share_target_files', 'readwrite');
+                } catch (err) {
+                    // the object store does not exist (e.g. database was created elsewhere)
+                    console.error("Could not open share_target_files object store", err);
+                    db.close();
+                    Events.fire('notify-user', Localization.getTranslation("notifications.share-target-files-error"));
+                    return;
+                }
+
                 const store = tx.objectStore('share_target_files');
                 const request = store.getAll();
                 request.onerror = e => {
                     console.error("Could not retrieve shared files", e);
+                    db.close();
                     Events.fire('notify-user', Localization.getTranslation("notifications.share-target-files-error"));
                 }
                 request.onsuccess = _ => {
                     const fileObjects = request.result;
 
                     if (shareTargetType === "files-error" || !fileObjects.length) {
-                        // the service worker could not save the shared files
+                        // the service worker could not save the shared files.
+                        // discard leftovers so they are not delivered with the next share
+                        const clearRequest = store.clear();
+                        clearRequest.onsuccess = _ => db.close();
+                        clearRequest.onerror = _ => db.close();
                         Events.fire('notify-user', Localization.getTranslation("notifications.share-target-files-error"));
                         return;
                     }
@@ -2725,6 +2808,7 @@ class WebShareTargetUI {
 
                     const clearRequest = store.clear()
                     clearRequest.onsuccess = _ => db.close();
+                    clearRequest.onerror = _ => db.close();
 
                     Events.fire('activate-share-mode', {files: filesReceived})
                 }
@@ -2736,7 +2820,7 @@ class WebShareTargetUI {
 // Keep for legacy reasons even though this is removed from new PWA installations
 class WebFileHandlersUI {
     async evaluateLaunchQueue() {
-        if (!"launchQueue" in window) return;
+        if (!("launchQueue" in window)) return;
 
         launchQueue.setConsumer(async launchParams => {
             console.log("Launched with: ", launchParams);

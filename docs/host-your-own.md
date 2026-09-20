@@ -331,9 +331,20 @@ RATE_LIMIT_WINDOW_MS=300000
 TRUST_PROXY=1
 ```
 
-> Default: `1` if `RATE_LIMIT` is enabled, `false` otherwise
+> Default: `1` if `RATE_LIMIT` is enabled, forwarded headers are trusted as before if unset and rate limiting is off
 >
 > Number of reverse proxy hops that are trusted to determine the IP address of the client.
+>
+> This setting also controls whether the `X-Forwarded-For` and `CF-Connecting-IP` request headers are
+> used to determine the client IP for device discovery (IP rooms):
+>
+> * `false`: the headers are ignored entirely — use this for instances that are exposed directly.
+>   Otherwise a client can spoof its IP address via the `X-Forwarded-For` header and thereby bypass
+>   the rate limit **and join the IP room of any other client**.
+> * `true` or a positive number: the headers are evaluated (the number sets the hop count used by the
+>   rate limiter).
+> * unset: the headers are evaluated (legacy behavior). Header values that are not valid IP addresses
+>   are always ignored.
 >
 > To find the correct number to use for this setting:
 >
@@ -343,9 +354,6 @@ TRUST_PROXY=1
 > 4. You have found the correct number if the IP addresses match. If not, then increase `TRUST_PROXY` by one and redo 1. - 4.
 >
 > e.g. on Render you must use TRUST_PROXY=5
->
-> If your instance is not behind a reverse proxy, set `TRUST_PROXY=false`. Otherwise a client can spoof its IP address
-> via the `X-Forwarded-For` header and thereby bypass the rate limit.
 >
 > The reverse proxy has to **append** to `X-Forwarded-For`
 > (e.g. `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` in nginx).

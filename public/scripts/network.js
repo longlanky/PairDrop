@@ -1,5 +1,8 @@
 class ServerConnection {
 
+    // max number of 1s retries for actions deferred until the ws connection is up
+    static MAX_DEFERRED_RETRIES = 30;
+
     constructor() {
         Events.on('pagehide', _ => this._disconnect());
         Events.on(window.visibilityChangeEvent, _ => this._onVisibilityChange());
@@ -21,9 +24,20 @@ class ServerConnection {
         Events.on('leave-public-room', _ => this._onLeavePublicRoom());
 
         Events.on('offline', _ => clearTimeout(this._reconnectTimer));
-        Events.on('online', _ => this._connect());
+        Events.on('online', _ => {
+            // If the config could not be loaded before, try again now
+            if (!this._config) {
+                this._getConfig()
+                    .then(() => this._connect())
+                    .catch(_ => {}); // error was already surfaced to the user
+                return;
+            }
+            this._connect();
+        });
 
-        this._getConfig().then(() => this._connect());
+        this._getConfig()
+            .then(() => this._connect())
+            .catch(_ => {}); // error was already surfaced to the user
     }
 
     _getConfig() {
@@ -65,6 +79,9 @@ class ServerConnection {
                         message: "Could not load the configuration of this PairDrop instance.",
                         persistent: true
                     });
+                    // reject instead of leaving the promise dangling forever:
+                    // the `online` event triggers a fresh attempt later on
+                    reject(new Error("Could not load config"));
                     return;
                 }
                 const delay = Math.min(1000 * 2 ** attempt, 30000);
@@ -106,6 +123,7 @@ class ServerConnection {
 
     _onOpen() {
         console.log('WS: server connected');
+        this._reconnectAttempts = 0;
         Events.fire('ws-connected');
         if (this._isReconnect) Events.fire('notify-user', Localization.getTranslation("notifications.connected"));
     }
@@ -118,9 +136,13 @@ class ServerConnection {
         this.send({ type: 'pair-device-initiate' });
     }
 
-    _onPairDeviceJoin(pairKey) {
+    _onPairDeviceJoin(pairKey, attempt = 0) {
         if (!this._isConnected()) {
-            setTimeout(() => this._onPairDeviceJoin(pairKey), 1000);
+            if (attempt >= ServerConnection.MAX_DEFERRED_RETRIES) {
+                Events.fire('notify-user', Localization.getTranslation("notifications.online-requirement-pairing"));
+                return;
+            }
+            setTimeout(() => this._onPairDeviceJoin(pairKey, attempt + 1), 1000);
             return;
         }
         this.send({ type: 'pair-device-join', pairKey: pairKey });
@@ -134,17 +156,23 @@ class ServerConnection {
         this.send({ type: 'create-public-room' });
     }
 
-    _onJoinPublicRoom(roomId, createIfInvalid) {
+    _onJoinPublicRoom(roomId, createIfInvalid, attempt = 0) {
         if (!this._isConnected()) {
-            setTimeout(() => this._onJoinPublicRoom(roomId, createIfInvalid), 1000);
+            if (attempt >= ServerConnection.MAX_DEFERRED_RETRIES) {
+                Events.fire('notify-user', Localization.getTranslation("notifications.online-requirement-public-room"));
+                return;
+            }
+            setTimeout(() => this._onJoinPublicRoom(roomId, createIfInvalid, attempt + 1), 1000);
             return;
         }
         this.send({ type: 'join-public-room', publicRoomId: roomId, createIfInvalid: createIfInvalid });
     }
 
-    _onLeavePublicRoom() {
+    _onLeavePublicRoom(attempt = 0) {
         if (!this._isConnected()) {
-            setTimeout(() => this._onLeavePublicRoom(), 1000);
+            // giving up is safe here: the server removes the peer when the socket closes
+            if (attempt >= ServerConnection.MAX_DEFERRED_RETRIES) return;
+            setTimeout(() => this._onLeavePublicRoom(attempt + 1), 1000);
             return;
         }
         this.send({ type: 'leave-public-room' });
@@ -271,7 +299,8 @@ class ServerConnection {
     _endpoint() {
         const protocol = location.protocol.startsWith('https') ? 'wss' : 'ws';
         // Check whether the instance specifies another signaling server otherwise use the current instance for signaling
-        let wsServerDomain = this._config.signalingServer
+        // `this._config` may be undefined if the config could not be loaded (yet)
+        let wsServerDomain = this._config && this._config.signalingServer
             ? this._config.signalingServer
             : location.host + location.pathname;
 
@@ -313,7 +342,11 @@ class ServerConnection {
         setTimeout(() => {
             this._isReconnect = true;
             Events.fire('ws-disconnected');
-            this._reconnectTimer = setTimeout(() => this._connect(), 1000);
+            // exponential backoff with jitter instead of hammering the server every second
+            const attempts = this._reconnectAttempts || 0;
+            this._reconnectAttempts = attempts + 1;
+            const delay = Math.min(1000 * 2 ** attempts, 30000) + Math.random() * 500;
+            this._reconnectTimer = setTimeout(() => this._connect(), delay);
         }, 100); //delay for 100ms to prevent flickering on page reload
     }
 
@@ -725,7 +758,16 @@ class Peer {
 
     _onTextReceived(message) {
         if (!message.text) return;
-        const escaped = decodeURIComponent(escape(atob(message.text)));
+        let escaped;
+        try {
+            escaped = decodeURIComponent(escape(atob(message.text)));
+        } catch (e) {
+            // atob throws on malformed base64 sent by a peer
+            console.error('Received text is not valid base64. Message dropped.', e);
+            Events.fire('notify-user', Localization.getTranslation("notifications.text-content-incorrect"));
+            this.sendJSON({ type: 'message-transfer-complete' });
+            return;
+        }
         Events.fire('text-received', { text: escaped, peerId: this._peerId });
         this.sendJSON({ type: 'message-transfer-complete' });
     }
@@ -833,8 +875,16 @@ class RTCPeer extends Peer {
         channel.onmessage = e => this._onMessage(e.data);
         channel.onclose = _ => this._onChannelClosed();
         this._channel = channel;
-        Events.on('beforeunload', e => this._onBeforeUnload(e));
-        Events.on('pagehide', _ => this._onPageHide());
+
+        // The channel is reopened on reconnects: register the page lifecycle
+        // listeners only once or they would accumulate per reconnect
+        if (!this._pageHideHandler) {
+            this._beforeUnloadHandler = e => this._onBeforeUnload(e);
+            this._pageHideHandler = _ => this._onPageHide();
+            Events.on('beforeunload', this._beforeUnloadHandler);
+            Events.on('pagehide', this._pageHideHandler);
+        }
+
         Events.fire('peer-connected', {peerId: this._peerId, connectionHash: this.getConnectionHash()});
     }
 
@@ -1053,6 +1103,10 @@ class PeersManager {
     }
 
     _onMessage(message) {
+        if (!message.sender || !this._peerExists(message.sender.id)) {
+            console.warn('Received a signal from an unknown peer. Message dropped.');
+            return;
+        }
         const peerId = message.sender.id;
         this.peers[peerId].onServerMessage(message);
     }
@@ -1109,21 +1163,43 @@ class PeersManager {
     _onWsRelay(message) {
         if (!this._wsConfig.wsFallback) return;
 
-        const messageJSON = JSON.parse(message);
-        if (messageJSON.type === 'ws-chunk') message = base64ToArrayBuffer(messageJSON.chunk);
+        let messageJSON;
+        try {
+            messageJSON = JSON.parse(message);
+        } catch (e) {
+            console.error('WS relay: malformed message', e);
+            return;
+        }
+
+        if (!messageJSON.sender || !this._peerExists(messageJSON.sender.id)) {
+            console.warn('WS relay: message from an unknown peer. Message dropped.');
+            return;
+        }
+
+        if (messageJSON.type === 'ws-chunk') {
+            try {
+                message = base64ToArrayBuffer(messageJSON.chunk);
+            } catch (e) {
+                console.error('WS relay: chunk is not valid base64. Chunk dropped.', e);
+                return;
+            }
+        }
         this.peers[messageJSON.sender.id]._onMessage(message);
     }
 
     _onRespondToFileTransferRequest(detail) {
+        if (!this._peerExists(detail.to)) return;
         this.peers[detail.to]._respondToFileTransferRequest(detail.accepted);
     }
 
     async _onFilesSelected(message) {
+        if (!this._peerExists(message.to)) return;
         let files = mime.addMissingMimeTypesToFiles([...message.files]);
         await this.peers[message.to].requestFileTransfer(files);
     }
 
     _onSendText(message) {
+        if (!this._peerExists(message.to)) return;
         this.peers[message.to].sendText(message.text);
     }
 
@@ -1173,7 +1249,11 @@ class PeersManager {
     _onPeerDisconnected(peerId) {
         const peer = this.peers[peerId];
         delete this.peers[peerId];
-        if (!peer || !peer._conn) return;
+        if (!peer) return;
+        // unregister the page lifecycle listeners of RTCPeers
+        if (peer._beforeUnloadHandler) Events.off('beforeunload', peer._beforeUnloadHandler);
+        if (peer._pageHideHandler) Events.off('pagehide', peer._pageHideHandler);
+        if (!peer._conn) return;
         if (peer._channel) peer._channel.onclose = null;
         peer._conn.close();
         peer._busy = false;

@@ -344,3 +344,82 @@ receive a text, and check the console for CSP violations.
 2. `docker build` to confirm the non-root user and the reduced build context work in CI.
 3. Rotate the TURN credential in `rtc_config.json` — it was logged in the clear by earlier
    versions with `DEBUG_MODE=true`.
+
+---
+
+# Addendum 3 — Round 2 audit (regressions, remainders, new findings), 2026-09-20
+
+Second autonomous audit round after commits `386b785` (P0/P1) and `5cb4c91` (P2).
+Scope approved by the maintainer: **Phases A+B+C** (security/DoS, client crashes, leaks/races),
+`TRUST_PROXY` fix as **tri-state + IP validation** (backward compatible), ops actions limited to
+`chmod 600 rtc_config.json` and `DEBUG_MODE=false` (TURN credential **not** rotated on request).
+Deferred (Phase D): graceful shutdown, `escapeHTML` quote-escaping, stringify-once in `_send`,
+display-name length cap, IDB log noise, cli `mktemp`, `node:test` suite.
+
+## Implemented
+
+| # | Cat | Location | Fix |
+|---|-----|----------|-----|
+| A1 | bug | `server/index.js` | `TRUST_PROXY=false`/`0` was parsed to `NaN` and silently became `1` when `RATE_LIMIT` was on (runtime-verified before the fix). Now tri-state: `true`/`false`/`0`/positive int; invalid values warn + fall back to the default. `app.set('trust proxy', …)` moved out of the `RATE_LIMIT` block so an explicit `TRUST_PROXY` is always honored |
+| A2 | bug/security | `server/peer.js _setIP` | `X-Forwarded-For`/`CF-Connecting-IP` were trusted unconditionally (verified: forged `XFF: 8.8.8.8` put a client into the `8.8.8.8` IP room even with `TRUST_PROXY=false`; garbage strings became room ids). Headers are now ignored when `TRUST_PROXY=false` and values are always validated with `net.isIP()` (fallback: socket ip). Unset `TRUST_PROXY` keeps the legacy behavior. `docs/host-your-own.md` updated |
+| A3 | hardening/DoS | `server/ws-server.js` | Unbounded `room-secrets`/`room-secrets-deleted` arrays (benchmarked: one sub-1MB frame with 14k secrets blocked the event loop ~0.5s via O(n²) `includes` and created 14k rooms). Now capped: 100 per message, 300 secret rooms per peer |
+| A4 | hardening | `server/ws-server.js` | Added `_wss.on('error')` listener (an unhandled `error` event would throw → `exit(1)` loop) |
+| B1 | bug | `public/scripts/network.js PeersManager` | #11 was only half fixed: `this.peers[peerId]` dereferences in `_onMessage`, `_onWsRelay`, `_onRespondToFileTransferRequest`, `_onFilesSelected`, `_onSendText` crashed on unknown/removed peers (e.g. a signal racing a `peer-left`). All guarded now; `_onWsRelay` also guards `JSON.parse` and `base64ToArrayBuffer` |
+| B2 | bug | `network.js Peer._onTextReceived` | `atob()` on peer-controlled text threw `InvalidCharacterError` uncaught. Now try/catch → user notification (`text-content-incorrect`) + `message-transfer-complete` so the sender does not stall |
+| B3 | bug | `ui.js WebFileHandlersUI` | `if (!"launchQueue" in window)` parses as `(!"launchQueue") in window` → always false → `ReferenceError` on `?file_handler` (operator semantics verified in node). Parenthesized |
+| B4 | bug | `ui.js PeersUI._onDrop` | `$$('x-peer').contains(target)` only checked the **first** peer node: dropping files on peer 2..n sent them *and* activated share mode. Now `e.target.closest('x-peer')` |
+| B5 | bug | `server/peer.js _setName` | `deviceName += ua.browser.name` produced the literal string `"undefined"` for unparseable UAs (verified with ua-parser-js: `foobar/1.0`, `""`, `curl/8.5.0`). `?? ''` + trim → `Unknown Device` |
+| B6 | bug | `util.js` clipboard polyfill | `Promise.error()` does not exist (TypeError on `execCommand` throw); `success` flag ignored. Proper reject/resolve now |
+| B7 | bug | `ui.js PairDeviceDialog` | Dead guard `!Object.keys(this.pairPeer)` (always false — verified) → `.length === 0` |
+| C1 | bug | `ui.js Notifications` | On the service-worker path (Android) `notification.close()` was called on a **Promise** (`showNotification()` resolves to `undefined`) → TypeError on every `visibilitychange`, handler never removed; `_bind` added a new `notificationclick` listener **per notification** → any click fired all past handlers (spurious downloads/clipboard writes). Reworked: single tag-based click router registered once, unified `close` for both paths, `$(peerId)` null guards. Also fixed `_copyText`: `if (await writeText())` was always falsy → success showed the *error* toast and rejected promises were unhandled |
+| C2 | bug | `ui.js Base64Dialog` | `hide()` removed listeners via fresh closures → click/input handlers accumulated per open (N-th open → N clipboard reads per click). Stable references now |
+| C3 | bug | `ui.js WebShareTargetUI` | `files-error`/empty path left **stale files in `share_target_files`** (delivered with the next successful share) and never closed the db. Store is cleared and the db closed on all paths; `db.transaction` wrapped (missing-store case) |
+| C4 | bug/leak | `ui.js PeerUI`, `network.js RTCPeer/PeersManager` | `share-mode-changed` listener per PeerUI and `beforeunload`/`pagehide` listeners per channel-open were never removed → detached DOM + object retention on peer churn. `PeerUI._destroy()` (called from `PeersUI._onPeerDisconnected`), once-only registration in `_onChannelOpened`, `Events.off` in `PeersManager._onPeerDisconnected` |
+| C5 | hardening | `service-worker.js evaluateRequestData` | Async promise-executor: `formData()` rejection or a missing object store left the redirect promise **unresolved** (share hangs, no error surfaced). try/catch → `?share_target=files-error`; URL built with the `URL` API (existing query strings no longer produce `?a=1?share_target=…`); db closed after use + `onversionchange`; `onblocked` handled; redundant `encodeURI` dropped |
+| C6 | bug/race | `ui.js EditPairedDevicesDialog` | Deferred `innerHTML=""` in `hide()` wiped the list when reopened within 300ms; interleaved `_initDOM` runs could duplicate entries. Synchronous clear on open + run-token guard; deferred wipe removed |
+| C7 | hardening | `network.js ServerConnection` | `_getConfig` left a dangling promise after 5 failed attempts and `_endpoint()` threw on `this._config` being undefined (e.g. `online` event before config load). Config promise now rejects (caught), `online` retries the config load, `_endpoint` falls back to same-origin. WS reconnect: exponential backoff 1s→30s + jitter (was fixed 1s forever). Deferred pair-join/join-room/leave-room retries capped at 30 |
+
+## Verification (this round)
+
+- `node --check` for all server and client scripts (all pass).
+- Runtime probes on throwaway instances (`PORT=3997/3998`):
+  - `TRUST_PROXY=false` + `RATE_LIMIT=true` → debug dump shows `"trustProxy": false` (was `1`);
+    `TRUST_PROXY=2` → `2`; `TRUST_PROXY=abc` → warning + default.
+  - Forged `X-Forwarded-For: 8.8.8.8` with `TRUST_PROXY=false` → `PairDrop uses: 127.0.0.1` (was `8.8.8.8`).
+  - Legacy mode (unset): valid XFF still honored (`9.9.9.9` room); garbage/`__proto__` XFF → socket ip fallback.
+  - `RATE_LIMIT_MAX=3` → 4th request 429; spoofed XFF does **not** reset the bucket.
+- WS regression suite (22 assertions, all pass): handshake, unknown-UA deviceName, XFF room isolation,
+  15-frame fuzz (no exception, valid secret among invalid ones still joins), `__proto__` pair key/public
+  room id rejected, pairing flow (initiate/join/single-use key), room-secrets flood (3000 → capped at 100,
+  server responsive after), public room create/join/leave, close → immediate `peer-left`, 2MB frame →
+  only offending socket closed (1009), secret regeneration.
+- HTTP: `/` 200, `/healthz` 200, `/config` valid, unknown path → 301 `/`, gzip applied, CSP header intact.
+- PM2 `PairDrop` (:3000) restarted with `DEBUG_MODE=false` (confirmed via `/proc/<pid>/environ` and logs):
+  `/` 200, `/healthz` 200. `rtc_config.json` is mode `600` now.
+
+## Behaviour changes to be aware of
+
+| Change | Before | After |
+|--------|--------|-------|
+| `TRUST_PROXY=false` | coerced to `1` hop when `RATE_LIMIT` on | honored as "trust nothing"; forwarded headers ignored for IP rooms |
+| Forwarded headers with unset `TRUST_PROXY` | trusted verbatim (any string became a room id) | trusted only if a valid IP (`net.isIP`), else socket ip |
+| `room-secrets` messages | unbounded | ≤100 secrets per message, ≤300 secret rooms per peer |
+| WS reconnect after server loss | every 1s forever | backoff 1s→30s + jitter, reset on connect |
+| Android notification click | every past handler fired; `close()` TypeError | single tag-routed handler; closes correctly |
+| Received malformed text | uncaught `InvalidCharacterError` | "Text content is incorrect" notification |
+
+## Still open (deferred to a follow-up round — Phase D)
+
+1. Graceful shutdown (SIGTERM drain; `server.on('error')` exits only on `EADDRINUSE`);
+   Dockerfile `ENTRYPOINT ["npm","start"]` → `CMD ["node","server/index.js"]` for reliable signal handling.
+2. `Localization.escapeHTML` does not escape quotes; `PeerUI.html()` interpolates into a `title="…"`
+   attribute (attribute-context breakout reachable via crafted `?base64zip` link; currently mitigated by
+   the CSP `script-src 'self'`). Use `setAttribute` or escape quotes.
+3. `_send`: stringify broadcast messages once instead of per recipient.
+4. Display-name length cap; `PersistentStorage` console-log noise; single-transaction `updateRoomSecret`.
+5. `pairdrop-cli`: predictable `/tmp/pairdrop-cli-temp` (→ `mktemp -d`).
+6. Minimal `node:test` suite for the server modules + `npm run lint`.
+7. TURN credential in `rtc_config.json` still the old one (rotation declined this round; file is `600`
+   and no longer logged since `DEBUG_MODE=false`).
+8. Browser end-to-end pass (pairing, transfers, share target, Android notifications) — the client-side
+   changes of this round are syntax-checked and logic-reviewed but were not run in a real browser.

@@ -8,6 +8,8 @@ const PING_INTERVAL_MS = 30000; // how often a peer is pinged
 const PING_TIMEOUT_MS = 90000; // disconnect a peer that did not respond for this long
 const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // terminate peers that do not read fast enough
 const MAX_PAYLOAD = 1024 * 1024; // ws-fallback chunks are 64 KB; larger messages are never valid
+const MAX_ROOM_SECRETS_PER_MESSAGE = 100; // legit clients hold a handful of secrets
+const MAX_ROOM_SECRETS_PER_PEER = 300; // hard cap of secret rooms a single peer may join
 
 export default class PairDropWsServer {
 
@@ -22,6 +24,8 @@ export default class PairDropWsServer {
         this._roomSecrets = Object.create(null); // { pairKey: roomSecret }
 
         this._wss = new WebSocketServer({ server, maxPayload: MAX_PAYLOAD });
+        // without a listener an `error` event would throw and take the process down
+        this._wss.on('error', e => console.error("WS: Websocket server error", e));
         this._wss.on('connection', (socket, request) => this._onConnection(new Peer(socket, request, conf)));
     }
 
@@ -176,9 +180,10 @@ export default class PairDropWsServer {
     _onRoomSecrets(sender, message) {
         if (!Array.isArray(message.roomSecrets)) return;
 
-        const roomSecrets = message.roomSecrets.filter(roomSecret => {
-            return this._isValidRoomSecret(roomSecret);
-        })
+        const roomSecrets = this._capRoomSecrets(sender, message.roomSecrets)
+            .filter(roomSecret => {
+                return this._isValidRoomSecret(roomSecret);
+            })
 
         this._joinSecretRooms(sender, roomSecrets);
     }
@@ -186,9 +191,19 @@ export default class PairDropWsServer {
     _onRoomSecretsDeleted(sender, message) {
         if (!Array.isArray(message.roomSecrets)) return;
 
-        for (let i = 0; i<message.roomSecrets.length; i++) {
-            this._deleteSecretRoom(message.roomSecrets[i]);
+        const roomSecrets = this._capRoomSecrets(sender, message.roomSecrets);
+        for (let i = 0; i<roomSecrets.length; i++) {
+            this._deleteSecretRoom(roomSecrets[i]);
         }
+    }
+
+    // Unbounded arrays would allow a single message to create thousands of rooms
+    // and to block the event loop in the O(n^2) `addRoomSecret` deduplication
+    _capRoomSecrets(sender, roomSecrets) {
+        if (roomSecrets.length <= MAX_ROOM_SECRETS_PER_MESSAGE) return roomSecrets;
+
+        console.warn("WS: Peer sent more than", MAX_ROOM_SECRETS_PER_MESSAGE, "room secrets. Ignoring the excess. Peer:", sender.id);
+        return roomSecrets.slice(0, MAX_ROOM_SECRETS_PER_MESSAGE);
     }
 
     _deleteSecretRoom(roomSecret) {
@@ -483,6 +498,10 @@ export default class PairDropWsServer {
 
     _joinSecretRooms(peer, roomSecrets) {
         for (let i=0; i<roomSecrets.length; i++) {
+            if (peer.roomSecrets.length >= MAX_ROOM_SECRETS_PER_PEER) {
+                console.warn("WS: Peer exceeded the maximum number of secret rooms. Ignoring the excess. Peer:", peer.id);
+                return;
+            }
             this._joinSecretRoom(peer, roomSecrets[i])
         }
     }

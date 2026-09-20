@@ -26,13 +26,18 @@ if (!navigator.clipboard) {
             try {
                 success = win.document.execCommand('copy');
             } catch (err) {
-                return Promise.error();
+                selection.removeAllRanges();
+                span.remove();
+                // `Promise.error` does not exist: reject properly instead
+                return Promise.reject(err);
             }
 
             selection.removeAllRanges();
             span.remove();
 
-            return Promise.resolve();
+            return success
+                ? Promise.resolve()
+                : Promise.reject(new Error('execCommand("copy") failed'));
         }
     }
 }

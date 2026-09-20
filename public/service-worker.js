@@ -162,7 +162,8 @@ self.addEventListener('fetch', function(event) {
         // Requests related to Web Share Target.
         event.respondWith((async () => {
             const share_url = await evaluateRequestData(event.request);
-            return Response.redirect(encodeURI(share_url), 302);
+            // share_url is built with the URL API and already properly encoded
+            return Response.redirect(share_url, 302);
         })());
     }
     else {
@@ -211,57 +212,90 @@ self.addEventListener('activate', evt => {
 
 const evaluateRequestData = function (request) {
     return new Promise(async (resolve) => {
-        const formData = await request.formData();
-        const title = formData.get("title");
-        const text = formData.get("text");
-        const url = formData.get("url");
-        const files = formData.getAll("allfiles");
+        const pairDropUrl = new URL(request.url);
+        pairDropUrl.searchParams.delete('share_target');
 
-        const pairDropUrl = request.url;
+        const filesErrorUrl = () => {
+            const url = new URL(pairDropUrl);
+            url.searchParams.set('share_target', 'files-error');
+            return url.toString();
+        };
 
-        if (files && files.length > 0) {
-            let fileObjects = [];
-            for (let i=0; i<files.length; i++) {
-                fileObjects.push({
-                    name: files[i].name,
-                    buffer: await files[i].arrayBuffer()
-                });
-            }
+        try {
+            const formData = await request.formData();
+            const title = formData.get("title");
+            const text = formData.get("text");
+            const url = formData.get("url");
+            const files = formData.getAll("allfiles");
 
-            const DBOpenRequest = indexedDB.open('pairdrop_store');
-            DBOpenRequest.onsuccess = e => {
-                const db = e.target.result;
-                for (let i = 0; i < fileObjects.length; i++) {
-                    const transaction = db.transaction('share_target_files', 'readwrite');
+            if (files && files.length > 0) {
+                let fileObjects = [];
+                for (let i=0; i<files.length; i++) {
+                    fileObjects.push({
+                        name: files[i].name,
+                        buffer: await files[i].arrayBuffer()
+                    });
+                }
+
+                const DBOpenRequest = indexedDB.open('pairdrop_store');
+                DBOpenRequest.onsuccess = e => {
+                    const db = e.target.result;
+                    db.onversionchange = _ => db.close();
+
+                    let transaction;
+                    try {
+                        transaction = db.transaction('share_target_files', 'readwrite');
+                    } catch (err) {
+                        // the object store does not exist (database was created without it)
+                        console.error("Could not open share_target_files object store", err);
+                        db.close();
+                        resolve(filesErrorUrl());
+                        return;
+                    }
                     const objectStore = transaction.objectStore('share_target_files');
 
-                    const objectStoreRequest = objectStore.add(fileObjects[i]);
-                    objectStoreRequest.onsuccess = _ => {
-                        if (i === fileObjects.length - 1) resolve(pairDropUrl + '?share_target=files');
-                    }
-                    // Without this the user is redirected to PairDrop without any
-                    // files and without any hint that the share failed.
-                    objectStoreRequest.onerror = e => {
-                        console.error("Could not save shared file", e);
-                        resolve(pairDropUrl + '?share_target=files-error');
+                    for (let i = 0; i < fileObjects.length; i++) {
+                        const objectStoreRequest = objectStore.add(fileObjects[i]);
+                        objectStoreRequest.onsuccess = _ => {
+                            if (i === fileObjects.length - 1) {
+                                db.close();
+                                pairDropUrl.searchParams.set('share_target', 'files');
+                                resolve(pairDropUrl.toString());
+                            }
+                        }
+                        // Without this the user is redirected to PairDrop without any
+                        // files and without any hint that the share failed.
+                        objectStoreRequest.onerror = e => {
+                            console.error("Could not save shared file", e);
+                            db.close();
+                            resolve(filesErrorUrl());
+                        }
                     }
                 }
+                DBOpenRequest.onerror = e => {
+                    console.error("Could not open database to save shared files", e);
+                    resolve(filesErrorUrl());
+                }
+                DBOpenRequest.onblocked = e => {
+                    console.error("Opening database to save shared files was blocked", e);
+                    resolve(filesErrorUrl());
+                }
             }
-            DBOpenRequest.onerror = e => {
-                console.error("Could not open database to save shared files", e);
-                resolve(pairDropUrl + '?share_target=files-error');
-            }
-        }
-        else {
-            // use `URLSearchParams` so that values containing `&`, `=`, `#` or
-            // whitespace cannot truncate or inject additional arguments
-            const searchParams = new URLSearchParams();
-            searchParams.set('share_target', 'text');
-            if (title) searchParams.set('title', title);
-            if (text) searchParams.set('text', text);
-            if (url) searchParams.set('url', url);
+            else {
+                // use `URLSearchParams` so that values containing `&`, `=`, `#` or
+                // whitespace cannot truncate or inject additional arguments
+                pairDropUrl.searchParams.set('share_target', 'text');
+                if (title) pairDropUrl.searchParams.set('title', title);
+                if (text) pairDropUrl.searchParams.set('text', text);
+                if (url) pairDropUrl.searchParams.set('url', url);
 
-            resolve(`${pairDropUrl}?${searchParams.toString()}`);
+                resolve(pairDropUrl.toString());
+            }
+        } catch (e) {
+            // e.g. the request body is not valid form data: without this the
+            // redirect promise would never resolve and the share would hang
+            console.error("Could not evaluate share target request", e);
+            resolve(filesErrorUrl());
         }
     });
 }

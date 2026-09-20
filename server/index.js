@@ -90,10 +90,10 @@ conf.rateLimitMax = parseInt(process.env.RATE_LIMIT_MAX) || 1000;
 conf.rateLimitWindowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 5 * 60 * 1000;
 
 // Number of reverse proxy hops that are trusted to determine the client ip.
-// `true` (trust all hops) is never used as it allows clients to spoof their ip.
-conf.trustProxy = process.env.TRUST_PROXY === "true"
-    ? true
-    : parseInt(process.env.TRUST_PROXY) || (conf.rateLimit ? 1 : false);
+// Tri-state: `true` trusts all hops (not recommended), `false`/`0` trusts none
+// (also disables forwarded-header trust for ip rooms), a positive integer sets
+// the hop count, and an unset variable keeps the previous default behaviour.
+conf.trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
 
 conf.buttons = {
     "donation_button": {
@@ -189,6 +189,21 @@ if (!conf.signalingServer) {
 }
 
 console.log('\nPairDrop is running on port', conf.port);
+
+function parseTrustProxy(value) {
+    if (value === undefined) {
+        // Unset: keep the previous default (1 hop when rate limiting, else no trust)
+        return undefined;
+    }
+    if (value === "true") return true;
+    if (value === "false") return false;
+
+    const parsed = parseInt(value);
+    if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+
+    console.error(`TRUST_PROXY: "${value}" is not a valid value. Use true, false or a non-negative integer. Falling back to the default.`);
+    return undefined;
+}
 
 function parseRtcConfig(path) {
     let content;

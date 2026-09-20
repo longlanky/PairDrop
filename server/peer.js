@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import net from "net";
 import parser from "ua-parser-js";
 import {animals, colors, uniqueNamesGenerator} from "unique-names-generator";
 import {cyrb53, hasher} from "./helper.js";
@@ -46,15 +47,26 @@ export default class Peer {
     }
 
     _setIP(request) {
-        if (request.headers['cf-connecting-ip']) {
-            this.ip = request.headers['cf-connecting-ip'].split(/\s*,\s*/)[0];
+        // Forwarded headers are client controlled. They are honored unless
+        // TRUST_PROXY is explicitly set to false (instances exposed directly).
+        // `undefined` keeps the previous default behavior for compatibility.
+        const trustForwardedHeaders = this.conf.trustProxy !== false;
+        const socketIp = request.socket.remoteAddress ?? '';
+
+        let forwardedIp = '';
+        if (trustForwardedHeaders) {
+            if (request.headers['cf-connecting-ip']) {
+                forwardedIp = request.headers['cf-connecting-ip'].split(/\s*,\s*/)[0];
+            }
+            else if (request.headers['x-forwarded-for']) {
+                forwardedIp = request.headers['x-forwarded-for'].split(/\s*,\s*/)[0];
+            }
         }
-        else if (request.headers['x-forwarded-for']) {
-            this.ip = request.headers['x-forwarded-for'].split(/\s*,\s*/)[0];
-        }
-        else {
-            this.ip = request.socket.remoteAddress ?? '';
-        }
+
+        // A header value that is not a valid ip must never become a room id
+        this.ip = forwardedIp && net.isIP(forwardedIp)
+            ? forwardedIp
+            : socketIp;
 
         // remove the prefix used for IPv4-translated addresses
         if (this.ip.substring(0,7) === "::ffff:") {
@@ -70,7 +82,7 @@ export default class Peer {
         if (this.conf.debugMode) {
             console.debug("\n");
             console.debug("----DEBUGGING-PEER-IP-START----");
-            console.debug("remoteAddress:", request.connection.remoteAddress);
+            console.debug("remoteAddress:", request.socket.remoteAddress);
             console.debug("x-forwarded-for:", request.headers['x-forwarded-for']);
             console.debug("cf-connecting-ip:", request.headers['cf-connecting-ip']);
             if (ipv6_was_localized) {
@@ -157,8 +169,12 @@ export default class Peer {
         if (ua.device.model) {
             deviceName += ua.device.model;
         } else {
-            deviceName += ua.browser.name;
+            // `ua.browser.name` is undefined for unparseable user agents.
+            // Concatenating it would produce the literal string "undefined".
+            deviceName += ua.browser.name ?? '';
         }
+
+        deviceName = deviceName.trim();
 
         if (!deviceName) {
             deviceName = 'Unknown Device';
