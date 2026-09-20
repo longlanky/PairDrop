@@ -1575,15 +1575,19 @@ class EditPairedDevicesDialog extends Dialog {
                 $pairedDevice.classList.add("paired-device");
                 $pairedDevice.setAttribute('placeholder', pairedDeviceRemovedString);
 
+                // display_name and device_name are set by the paired peer and must be escaped
+                const displayName = Localization.escapeHTML(roomSecretsEntry.display_name || "");
+                const deviceName = Localization.escapeHTML(roomSecretsEntry.device_name || "");
+
                 $pairedDevice.innerHTML = `
                     <div class="display-name">
                         <span class="fw">
-                            ${roomSecretsEntry.display_name}
+                            ${displayName}
                         </span>
                     </div>
                     <div class="device-name">
                         <span class="fw">
-                            ${roomSecretsEntry.device_name}
+                            ${deviceName}
                         </span>
                     </div>
                     <div class="button-wrapper row fw center wrap">

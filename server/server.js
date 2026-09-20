@@ -1,5 +1,7 @@
 import express from "express";
 import RateLimit from "express-rate-limit";
+import helmet from "helmet";
+import compression from "compression";
 import {fileURLToPath} from "url";
 import path, {dirname} from "path";
 import http from "http";
@@ -9,23 +11,56 @@ export default class PairDropServer {
     constructor(conf) {
         const app = express();
 
+        app.disable('x-powered-by');
+
+        // Security headers. HSTS and `upgrade-insecure-requests` are deliberately not set:
+        // many instances are self-hosted via plain http on a local network. Both should be
+        // configured on the reverse proxy for instances that are served via https.
+        app.use(helmet({
+            hsts: false,
+            contentSecurityPolicy: {
+                useDefaults: false,
+                directives: {
+                    defaultSrc: ["'self'"],
+                    scriptSrc: ["'self'"],
+                    // zip.js and heic2any spawn workers from `blob:` urls
+                    workerSrc: ["'self'", "blob:"],
+                    fontSrc: ["'self'", "data:"],
+                    // `blob:`/`data:` are required for previews and received files
+                    imgSrc: ["'self'", "data:", "blob:"],
+                    mediaSrc: ["'self'", "blob:"],
+                    // inline `style` attributes are used by index.html and the icon sprites
+                    styleSrc: ["'self'", "'unsafe-inline'"],
+                    // WebRTC/STUN/TURN and a possibly external signaling server need
+                    // to be reachable, therefore `connect-src` cannot be limited to 'self'
+                    connectSrc: ["'self'", "ws:", "wss:", "http:", "https:"],
+                    objectSrc: ["'none'"],
+                    baseUri: ["'self'"],
+                    formAction: ["'self'"],
+                    frameAncestors: ["'self'"],
+                }
+            }
+        }));
+
+        app.use(compression());
+
         if (conf.rateLimit) {
             const limiter = RateLimit({
-                windowMs: 5 * 60 * 1000, // 5 minutes
-                max: 1000, // Limit each IP to 1000 requests per `window` (here, per 5 minutes)
+                windowMs: conf.rateLimitWindowMs || 5 * 60 * 1000, // 5 minutes by default
+                max: conf.rateLimitMax || 1000, // Limit each IP to 1000 requests per `window` by default
                 message: 'Too many requests from this IP Address, please try again after 5 minutes.',
                 standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
                 legacyHeaders: false, // Disable the `X-RateLimit-*` headers
             })
 
-            app.use(limiter);
             // ensure correct client ip and not the ip of the reverse proxy is used for rate limiting
             // see https://express-rate-limit.mintlify.app/guides/troubleshooting-proxy-issues
+            app.set('trust proxy', conf.trustProxy);
 
-            app.set('trust proxy', conf.rateLimit);
+            app.use(limiter);
 
             if (!conf.debugMode) {
-                console.log("Use DEBUG_MODE=true to find correct number for RATE_LIMIT.");
+                console.log("Use DEBUG_MODE=true to find correct number of RATE_LIMIT.");
             }
         }
 
@@ -54,13 +89,20 @@ export default class PairDropServer {
             });
         });
 
-        app.use((req, res) => {
-            res.redirect(301, '/');
+        // Unauthenticated health check used by container orchestrators and reverse proxies
+        app.get('/healthz', (req, res) => {
+            res.status(200).send('ok');
         });
 
         app.get('/', (req, res) => {
-            res.sendFile('index.html');
-            console.log(`Serving client files from:\n${publicPathAbs}`)
+            res.sendFile(path.join(publicPathAbs, 'index.html'));
+        });
+
+        console.log(`Serving client files from:\n${publicPathAbs}`)
+
+        // Unknown paths are redirected to the client. Must be registered last.
+        app.use((req, res) => {
+            res.redirect(301, '/');
         });
 
         const hostname = conf.localhostOnly ? '127.0.0.1' : null;

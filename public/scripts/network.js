@@ -30,35 +30,54 @@ class ServerConnection {
         console.log("Loading config...")
         return new Promise((resolve, reject) => {
             let xhr = new XMLHttpRequest();
+            let attempt = 0;
+            const maxAttempts = 5;
+
             xhr.addEventListener("load", () => {
                 if (xhr.status === 200) {
                     // Config received
-                    let config = JSON.parse(xhr.responseText);
+                    let config;
+                    try {
+                        config = JSON.parse(xhr.responseText);
+                    } catch (e) {
+                        console.error("Config is malformed:", e);
+                        retry();
+                        return;
+                    }
                     console.log("Config loaded:", config)
                     this._config = config;
                     Events.fire('config', config);
                     resolve()
                 } else if (xhr.status < 200 || xhr.status >= 300) {
-                    retry(xhr);
+                    retry();
                 }
             })
 
             xhr.addEventListener("error", _ => {
-                retry(xhr);
+                retry();
             });
 
-            function retry(request) {
-                setTimeout(function () {
-                    openAndSend(request)
-                }, 1000)
-            }
+            // Retry with exponential backoff instead of hammering the server every second
+            const retry = () => {
+                if (attempt >= maxAttempts) {
+                    console.error("Could not load config after", attempt, "attempts");
+                    Events.fire('notify-user', {
+                        message: "Could not load the configuration of this PairDrop instance.",
+                        persistent: true
+                    });
+                    return;
+                }
+                const delay = Math.min(1000 * 2 ** attempt, 30000);
+                attempt++;
+                setTimeout(() => openAndSend(), delay);
+            };
 
             function openAndSend() {
                 xhr.open('GET', 'config');
                 xhr.send();
             }
 
-            openAndSend(xhr);
+            openAndSend();
         })
     }
 
@@ -117,7 +136,7 @@ class ServerConnection {
 
     _onJoinPublicRoom(roomId, createIfInvalid) {
         if (!this._isConnected()) {
-            setTimeout(() => this._onJoinPublicRoom(roomId), 1000);
+            setTimeout(() => this._onJoinPublicRoom(roomId, createIfInvalid), 1000);
             return;
         }
         this.send({ type: 'join-public-room', publicRoomId: roomId, createIfInvalid: createIfInvalid });
@@ -132,7 +151,13 @@ class ServerConnection {
     }
 
     _onMessage(msg) {
-        msg = JSON.parse(msg);
+        try {
+            msg = JSON.parse(msg);
+        } catch (e) {
+            console.error('WS receive: malformed message', e);
+            return;
+        }
+        if (!msg || typeof msg.type !== 'string') return;
         if (msg.type !== 'ping') console.log('WS receive:', msg);
         switch (msg.type) {
             case 'ws-config':

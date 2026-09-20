@@ -29,6 +29,10 @@ export default class Peer {
         this.pairKey = null;
 
         this.publicRoomId = null;
+
+        // set by the ws server: { timer, lastBeat }
+        this.keepAlive = null;
+        this.disconnected = false;
     }
 
     rateLimitReached() {
@@ -195,14 +199,16 @@ export default class Peer {
     }
 
     addRoomSecret(roomSecret) {
-        if (!(roomSecret in this.roomSecrets)) {
+        // `roomSecret in this.roomSecrets` would check indices, not values
+        if (!this.roomSecrets.includes(roomSecret)) {
             this.roomSecrets.push(roomSecret);
         }
     }
 
     removeRoomSecret(roomSecret) {
-        if (roomSecret in this.roomSecrets) {
-            delete this.roomSecrets[roomSecret];
+        const index = this.roomSecrets.indexOf(roomSecret);
+        if (index > -1) {
+            this.roomSecrets.splice(index, 1);
         }
     }
 }

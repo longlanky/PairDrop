@@ -10,4 +10,11 @@ pairdrop-cli
 *.yml
 Dockerfile
 rtc_config_example.json
+rtc_config.json
 turnserver_example.conf
+turnserver.conf
+ecosystem.config.cjs
+.pairdrop-cli-config
+.pairdrop-cli-config.example
+ssl/
+certs/

@@ -16,12 +16,30 @@ process.on('SIGTERM', () => {
     process.exit(0)
 })
 
+// Evaluate arguments for deployment with Docker and Node.js
+let conf = {};
+
 // Handle APP ERRORS
+// Continuing after an uncaught exception is unsafe as application state might be corrupted.
+// The process is exited instead so that the process manager (Docker, systemd, pm2) can restart it.
 process.on('uncaughtException', (error, origin) => {
-    console.log('----- Uncaught exception -----')
-    console.log(error)
-    console.log('----- Exception origin -----')
-    console.log(origin)
+    console.error('----- Uncaught exception -----')
+    console.error(error)
+    console.error('----- Exception origin -----')
+    console.error(origin)
+    if (conf.autoStart) {
+        // spawn a new instance as this one is about to exit
+        process.once('exit', () => spawn(
+            process.argv[0],
+            process.argv.slice(1),
+            {
+                cwd: process.cwd(),
+                detached: true,
+                stdio: 'inherit'
+            }
+        ));
+    }
+    process.exit(1)
 })
 process.on('unhandledRejection', (reason, promise) => {
     console.log('----- Unhandled Rejection at -----')
@@ -30,9 +48,6 @@ process.on('unhandledRejection', (reason, promise) => {
     console.log(reason)
 })
 
-// Evaluate arguments for deployment with Docker and Node.js
-let conf = {};
-
 conf.debugMode = process.env.DEBUG_MODE === "true";
 
 conf.port = process.env.PORT || 3000;
@@ -40,7 +55,7 @@ conf.port = process.env.PORT || 3000;
 conf.wsFallback = process.argv.includes('--include-ws-fallback') || process.env.WS_FALLBACK === "true";
 
 conf.rtcConfig = process.env.RTC_CONFIG && process.env.RTC_CONFIG !== "false"
-    ? JSON.parse(fs.readFileSync(process.env.RTC_CONFIG, 'utf8'))
+    ? parseRtcConfig(process.env.RTC_CONFIG)
     : {
         "sdpSemantics": "unified-plan",
         "iceServers": [
@@ -59,7 +74,7 @@ conf.ipv6Localize = parseInt(process.env.IPV6_LOCALIZE) || false;
 
 let rateLimit = false;
 if (process.argv.includes('--rate-limit') || process.env.RATE_LIMIT === "true") {
-    rateLimit = 5;
+    rateLimit = true;
 }
 else {
     let envRateLimit = parseInt(process.env.RATE_LIMIT);
@@ -68,6 +83,17 @@ else {
     }
 }
 conf.rateLimit = rateLimit;
+
+// `RATE_LIMIT` only enables rate limiting. The number of requests and the window
+// are configured separately so that `RATE_LIMIT` cannot be mistaken for hop count.
+conf.rateLimitMax = parseInt(process.env.RATE_LIMIT_MAX) || 1000;
+conf.rateLimitWindowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 5 * 60 * 1000;
+
+// Number of reverse proxy hops that are trusted to determine the client ip.
+// `true` (trust all hops) is never used as it allows clients to spoof their ip.
+conf.trustProxy = process.env.TRUST_PROXY === "true"
+    ? true
+    : parseInt(process.env.TRUST_PROXY) || (conf.rateLimit ? 1 : false);
 
 conf.buttons = {
     "donation_button": {
@@ -147,30 +173,9 @@ if (conf.debugMode) {
     console.log("DEBUG_MODE is active. To protect privacy, do not use in production.");
     console.debug("\n");
     console.debug("----DEBUG ENVIRONMENT VARIABLES----")
-    console.debug(JSON.stringify(conf, null, 4));
+    // RTC_CONFIG contains credentials of TURN servers. Never log them.
+    console.debug(JSON.stringify(redactConf(conf), null, 4));
     console.debug("\n");
-}
-
-// Start a new PairDrop instance when an uncaught exception occurs
-if (conf.autoStart) {
-    process.on(
-        'uncaughtException',
-        () => {
-            process.once(
-                'exit',
-                () => spawn(
-                    process.argv.shift(),
-                    process.argv,
-                    {
-                        cwd: process.cwd(),
-                        detached: true,
-                        stdio: 'inherit'
-                    }
-                )
-            );
-            process.exit();
-        }
-    );
 }
 
 // Start server to serve client files
@@ -184,3 +189,44 @@ if (!conf.signalingServer) {
 }
 
 console.log('\nPairDrop is running on port', conf.port);
+
+function parseRtcConfig(path) {
+    let content;
+    try {
+        content = fs.readFileSync(path, 'utf8');
+    } catch (e) {
+        console.error(`RTC_CONFIG: could not read file "${path}": ${e.message}`);
+        process.exit(1);
+    }
+
+    let rtcConfig;
+    try {
+        rtcConfig = JSON.parse(content);
+    } catch (e) {
+        console.error(`RTC_CONFIG: file "${path}" does not contain valid JSON: ${e.message}`);
+        process.exit(1);
+    }
+
+    if (!rtcConfig || !Array.isArray(rtcConfig.iceServers)) {
+        console.error(`RTC_CONFIG: file "${path}" must contain an array of "iceServers".`);
+        process.exit(1);
+    }
+
+    return rtcConfig;
+}
+
+function redactConf(conf) {
+    const redacted = JSON.parse(JSON.stringify(conf));
+
+    if (redacted.rtcConfig && Array.isArray(redacted.rtcConfig.iceServers)) {
+        redacted.rtcConfig.iceServers = redacted.rtcConfig.iceServers.map(iceServer => {
+            return {
+                ...iceServer,
+                credential: iceServer.credential ? "<redacted>" : undefined,
+                username: iceServer.username ? "<redacted>" : undefined
+            }
+        });
+    }
+
+    return redacted;
+}
