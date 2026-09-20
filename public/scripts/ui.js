@@ -227,6 +227,9 @@ class PeersUI {
         // prevent send on paste when dialog is open
         if (this.shareMode.active || Dialog.anyDialogShown()) return;
 
+        // let the browser handle pastes into editable fields (e.g. the display name)
+        if (e.target.closest && e.target.closest('input, textarea, [contenteditable]')) return;
+
         e.preventDefault()
         let files = e.clipboardData.files;
         let text = e.clipboardData.getData("Text");
@@ -445,8 +448,12 @@ class PeerUI {
             ? Localization.getTranslation("peer-ui.click-to-send-share-mode", null, {descriptor: this._shareMode.descriptor})
             : Localization.getTranslation("peer-ui.click-to-send");
 
+        // `title` is escaped for content, not for an attribute context: the
+        // descriptor can contain a filename, so escape quotes before insertion
+        const titleAttribute = title.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
         this.$el.innerHTML = `
-            <label class="column center pointer" title="${title}">
+            <label class="column center pointer" title="${titleAttribute}">
                 <input type="file" multiple/>
                 <x-icon>
                     <div class="icon-wrapper" shadow="1">
@@ -2545,15 +2552,14 @@ class Notifications {
     }
 
     async _requestPermission() {
-        await Notification.
-            requestPermission(permission => {
-                if (permission !== 'granted') {
-                    Events.fire('notify-user', Localization.getTranslation("notifications.notifications-permissions-error"));
-                    return;
-                }
-                Events.fire('notify-user', Localization.getTranslation("notifications.notifications-enabled"));
-                this.$headerNotificationButton.setAttribute('hidden', true);
-            });
+        // the callback argument is deprecated and ignored by some browsers: use the promise result
+        const permission = await Notification.requestPermission();
+        if (permission !== 'granted') {
+            Events.fire('notify-user', Localization.getTranslation("notifications.notifications-permissions-error"));
+            return;
+        }
+        Events.fire('notify-user', Localization.getTranslation("notifications.notifications-enabled"));
+        this.$headerNotificationButton.setAttribute('hidden', true);
     }
 
     _registerSwClickRouter() {
@@ -2575,7 +2581,7 @@ class Notifications {
     _notify(title, body, onClick) {
         const config = {
             body: body,
-            icon: '/images/logo_transparent_128x128.png',
+            icon: 'images/android-chrome-192x192.png',
         };
 
         let notification = null;
@@ -2765,6 +2771,11 @@ class WebShareTargetUI {
             let openRequest = window.indexedDB.open('pairdrop_store')
             openRequest.onerror = e => {
                 console.error("Could not open database to retrieve shared files", e);
+                Events.fire('notify-user', Localization.getTranslation("notifications.share-target-files-error"));
+            }
+            openRequest.onblocked = e => {
+                // an upgrade is pending in another tab: surface the failure instead of hanging
+                console.error("Opening database to retrieve shared files was blocked", e);
                 Events.fire('notify-user', Localization.getTranslation("notifications.share-target-files-error"));
             }
             openRequest.onsuccess = e => {

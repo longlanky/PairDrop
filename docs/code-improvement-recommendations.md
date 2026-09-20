@@ -423,3 +423,51 @@ display-name length cap, IDB log noise, cli `mktemp`, `node:test` suite.
    and no longer logged since `DEBUG_MODE=false`).
 8. Browser end-to-end pass (pairing, transfers, share target, Android notifications) — the client-side
    changes of this round are syntax-checked and logic-reviewed but were not run in a real browser.
+
+---
+
+# Addendum 4 — Round 3 audit (new findings + Phase D carry-over), 2026-09-20
+
+Third autonomous audit round. Focus: broken asset references, the service worker, client parser
+robustness, server DoS surface and the Phase D leftovers.
+
+## Implemented
+
+| # | Cat | Location | Fix |
+|---|-----|----------|-----|
+| 1 | bug | `ui.js Notifications._notify` | Notification icon referenced `images/logo_transparent_128x128.png` (file never existed) via an absolute path. Now `images/android-chrome-192x192.png` (relative, works under a subpath) |
+| 2 | bug | `index.html` | `og:image`/`twitter:image` pointed at the non-existent `logo_transparent_512x512.png`; now the existing `logo_transparent_white_512x512.png` |
+| 3 | performance | `service-worker.js fromNetwork/updateCache` | Every cache miss fetched the same request **twice** (once to respond, once to update the cache). The fetched response is cloned and handed to `updateCache`; one network round-trip per asset |
+| 4 | bug | `ui.js PeersUI._onPaste` | The global `paste` handler swallowed pastes into editable elements, so pasting into the contenteditable display name activated share mode instead. Editable targets are now excluded |
+| 5 | bug/hardening | `network.js Peer/RTCPeer._onMessage` | `JSON.parse` of a peer-sent RTC string was unguarded (remote-triggerable `SyntaxError`). Both parses are now try/catch → warn + drop |
+| 6 | hardening | `network.js ServerConnection/PeersManager` | `this._wsConfig.*` was dereferenced before `ws-config` could arrive; all uses now guard |
+| 7 | hardening/DoS | `ws-server.js`, `peer.js` | Added a per-peer sliding-window rate limit (50/s) for cheap-to-send control messages (`room-secrets*`, pairing, public/ip rooms). Transfer/relay frames are not limited |
+| 8 | bug | `ui.js Notifications._requestPermission` | The resolved permission was ignored (the callback argument is deprecated and ignored by some browsers), so the granted/denied feedback never ran. Now uses the promise result |
+| 9 | hardening | `network.js FileChunker/Peer` | A `FileReader` error only logged and stalled the transfer. It now notifies the user and resets the sender state |
+| 10 | hardening | `ui.js WebShareTargetUI` | `indexedDB.open` had no `onblocked`, so a pending upgrade made the share hang silently. Now surfaces `share-target-files-error` |
+| 11 | bug/security | `ui.js PeerUI.html` | The share-mode `title="…"` attribute interpolated a descriptor (a filename, reachable via `?base64zip`) with quote-unsafe escaping. Quotes are escaped for the attribute context |
+| 12 | hardening | `Dockerfile`, `server/index.js`, `ws-server.js` | `ENTRYPOINT ["npm","start"]` (npm does not forward SIGTERM) → `CMD ["node","server/index.js"]`; SIGINT/SIGTERM now drain the WS server and HTTP server, with a 5 s force-exit fallback |
+| 13 | hardening | `server/server.js` | The HTTP rate limiter counted every static asset (a page load is dozens of requests) and hardcoded “5 minutes”. Static assets and `/healthz` are skipped and the message uses the configured window |
+| 14 | performance | `ws-server.js _send` | Broadcast loops stringified the same message once per recipient; the JSON is now built once and passed to `_send` |
+| 15 | hardening | `network.js Peer._onDisplayNameChanged/sendDisplayName` | Peer-controlled display names are capped at 100 chars |
+| 16 | enhancement | `persistent-storage.js` | Removed per-operation success logs (incl. stored values); a rejected `_dbPromise` is reset so a later call can retry |
+| 17 | hardening | `pairdrop-cli/pairdrop` | Predictable `/tmp/pairdrop-cli-temp` → `mktemp -d` with an `EXIT` trap; hash temp file moved into the private dir |
+| 18 | hardening | `server/index.js` | `RATE_LIMIT_MAX`/`RATE_LIMIT_WINDOW_MS` require a positive integer; `TRUST_PROXY=true` logs a warning |
+
+## Verification (this round)
+
+- `node --check` for every touched server/client file, `bash -n pairdrop-cli/pairdrop`, JSON parse of
+  `en.json`/`package.json`: all pass.
+- Runtime (`PORT=3999`, `RATE_LIMIT=true RATE_LIMIT_MAX=2`): `/healthz` 200, `/` 200, `/config` 429 from
+  the 3rd request while `/scripts/ui.js` and `/healthz` stay 200 (static skip verified).
+- SIGTERM to a directly-started instance logs `SIGTERM received, shutting down...` and exits cleanly.
+- Two WS clients: handshake (`ws-config`, `display-name`), IP room `peers` + `peer-joined` delivered,
+  and a 60-message `join-ip-room` flood is capped (server logs the rate warning; connection survives).
+
+## Deliberately not changed (needs a product/UX decision)
+
+- `FileDigester` still buffers a whole received file in memory (backlog #13); a desktop size cap changes UX.
+- `Localization.escapeHTML` still does not escape quotes globally — changing it would leak `&quot;`/`&#39;`
+  into `setAttribute`/`data-i18n-attrs` tooltips. Only the injectable `PeerUI` attribute was fixed.
+- No test framework/lint added (repo has none; `CONTRIBUTING.md` favours simplicity).
+- `updateRoomSecret` remains a read-then-write across two transactions (atomicity nit).

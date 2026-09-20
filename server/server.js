@@ -53,12 +53,17 @@ export default class PairDropServer {
         app.set('trust proxy', trustProxy);
 
         if (conf.rateLimit) {
+            const windowMs = conf.rateLimitWindowMs || 5 * 60 * 1000; // 5 minutes by default
+            const windowMinutes = Math.max(1, Math.round(windowMs / 60000));
             const limiter = RateLimit({
-                windowMs: conf.rateLimitWindowMs || 5 * 60 * 1000, // 5 minutes by default
+                windowMs: windowMs,
                 max: conf.rateLimitMax || 1000, // Limit each IP to 1000 requests per `window` by default
-                message: 'Too many requests from this IP Address, please try again after 5 minutes.',
+                message: `Too many requests from this IP Address, please try again after ${windowMinutes} minute${windowMinutes === 1 ? '' : 's'}.`,
                 standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
                 legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+                // A single page load requests dozens of assets; only the app
+                // shell, config and health endpoint should consume the budget.
+                skip: req => req.path === '/healthz' || /\.[a-z0-9]+$/i.test(req.path),
             })
 
             app.use(limiter);

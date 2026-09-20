@@ -10,6 +10,13 @@ const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // terminate peers that do not rea
 const MAX_PAYLOAD = 1024 * 1024; // ws-fallback chunks are 64 KB; larger messages are never valid
 const MAX_ROOM_SECRETS_PER_MESSAGE = 100; // legit clients hold a handful of secrets
 const MAX_ROOM_SECRETS_PER_PEER = 300; // hard cap of secret rooms a single peer may join
+// Control-plane messages that are cheap to trigger for a client but potentially
+// expensive for the server (room creation, secret handling, pairing).
+const RATE_LIMITED_MESSAGE_TYPES = new Set([
+    'room-secrets', 'room-secrets-deleted', 'pair-device-initiate', 'pair-device-join',
+    'pair-device-cancel', 'regenerate-room-secret', 'create-public-room', 'join-public-room',
+    'leave-public-room', 'join-ip-room'
+]);
 
 export default class PairDropWsServer {
 
@@ -27,6 +34,14 @@ export default class PairDropWsServer {
         // without a listener an `error` event would throw and take the process down
         this._wss.on('error', e => console.error("WS: Websocket server error", e));
         this._wss.on('connection', (socket, request) => this._onConnection(new Peer(socket, request, conf)));
+    }
+
+    close() {
+        // stop accepting new connections and drop the remaining sockets
+        for (const socket of this._wss.clients) {
+            try { socket.terminate(); } catch (e) { /* already closed */ }
+        }
+        this._wss.close();
     }
 
     _onConnection(peer) {
@@ -65,6 +80,13 @@ export default class PairDropWsServer {
         }
 
         if (!message || typeof message.type !== 'string') return;
+
+        // Cheap flood protection: transfer/relay frames are not limited, but
+        // control-plane messages that create rooms or hash secrets are.
+        if (RATE_LIMITED_MESSAGE_TYPES.has(message.type) && sender.messageRateReached()) {
+            console.warn("WS: Peer exceeded the control message rate. Ignoring message. Peer:", sender.id, "Type:", message.type);
+            return;
+        }
 
         // A malformed but syntactically valid message must never take down the server
         try {
@@ -212,15 +234,15 @@ export default class PairDropWsServer {
         const room = this._rooms[roomSecret];
         if (!room) return;
 
+        const message = { type: 'secret-room-deleted', roomSecret: roomSecret };
+        const json = JSON.stringify(message);
+
         for (const peerId in room) {
             const peer = room[peerId];
 
             this._leaveSecretRoom(peer, roomSecret, true);
 
-            this._send(peer, {
-                type: 'secret-room-deleted',
-                roomSecret: roomSecret,
-            });
+            this._send(peer, message, json);
         }
     }
 
@@ -446,18 +468,19 @@ export default class PairDropWsServer {
         }
 
         // notify all other peers that remain in room that peer left
+        const leaveMessage = {
+            type: 'peer-left',
+            peerId: peer.id,
+            roomType: roomType,
+            roomId: roomId,
+            disconnect: disconnect
+        };
+        const leaveJson = JSON.stringify(leaveMessage);
+
         for (const otherPeerId in this._rooms[roomId]) {
             const otherPeer = this._rooms[roomId][otherPeerId];
 
-            let msg = {
-                type: 'peer-left',
-                peerId: peer.id,
-                roomType: roomType,
-                roomId: roomId,
-                disconnect: disconnect
-            };
-
-            this._send(otherPeer, msg);
+            this._send(otherPeer, leaveMessage, leaveJson);
         }
     }
 
@@ -465,18 +488,19 @@ export default class PairDropWsServer {
         if (!this._rooms[roomId]) return;
 
         // notify all other peers that peer joined
+        const joinedMessage = {
+            type: 'peer-joined',
+            peer: peer.getInfo(),
+            roomType: roomType,
+            roomId: roomId
+        };
+        const joinedJson = JSON.stringify(joinedMessage);
+
         for (const otherPeerId in this._rooms[roomId]) {
             if (otherPeerId === peer.id) continue;
             const otherPeer = this._rooms[roomId][otherPeerId];
 
-            let msg = {
-                type: 'peer-joined',
-                peer: peer.getInfo(),
-                roomType: roomType,
-                roomId: roomId
-            };
-
-            this._send(otherPeer, msg);
+            this._send(otherPeer, joinedMessage, joinedJson);
         }
 
         // notify peer about peers already in the room
@@ -514,7 +538,7 @@ export default class PairDropWsServer {
         }
     }
 
-    _send(peer, message) {
+    _send(peer, message, json = null) {
         if (!peer || !peer.socket) return;
         if (peer.socket.readyState !== WebSocket.OPEN) return;
 
@@ -526,7 +550,8 @@ export default class PairDropWsServer {
         }
 
         try {
-            peer.socket.send(JSON.stringify(message));
+            // `json` is passed by broadcast loops so the message is only stringified once
+            peer.socket.send(json ?? JSON.stringify(message));
         } catch (e) {
             console.error("WS: Could not send message to peer", peer.id, e);
         }

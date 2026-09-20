@@ -17,6 +17,8 @@ class PersistentStorage {
                 PersistentStorage.logBrowserNotCapable();
                 console.log('Error initializing database: ');
                 console.log(e)
+                // allow a later call to retry instead of caching a rejected promise
+                PersistentStorage._dbPromise = null;
             });
     }
 
@@ -91,7 +93,10 @@ class PersistentStorage {
     static _getDb() {
         if (!PersistentStorage._dbPromise) {
             // fallback if a static method is called before the constructor ran
-            PersistentStorage._dbPromise = PersistentStorage._openDb();
+            const dbPromise = PersistentStorage._dbPromise = PersistentStorage._openDb();
+            dbPromise.catch(() => {
+                if (PersistentStorage._dbPromise === dbPromise) PersistentStorage._dbPromise = null;
+            });
         }
         return PersistentStorage._dbPromise;
     }
@@ -114,7 +119,6 @@ class PersistentStorage {
         return this._withObjectStore('keyval', 'readwrite', (objectStore, resolve, reject) => {
             const objectStoreRequest = objectStore.put(value, key);
             objectStoreRequest.onsuccess = _ => {
-                console.log(`Request successful. Added key-pair: ${key} - ${value}`);
                 resolve(value);
             };
             objectStoreRequest.onerror = e => reject(e);
@@ -125,7 +129,6 @@ class PersistentStorage {
         return this._withObjectStore('keyval', 'readonly', (objectStore, resolve, reject) => {
             const objectStoreRequest = objectStore.get(key);
             objectStoreRequest.onsuccess = _ => {
-                console.log(`Request successful. Retrieved key-pair: ${key} - ${objectStoreRequest.result}`);
                 resolve(objectStoreRequest.result);
             }
             objectStoreRequest.onerror = e => reject(e);
@@ -136,7 +139,6 @@ class PersistentStorage {
         return this._withObjectStore('keyval', 'readwrite', (objectStore, resolve, reject) => {
             const objectStoreRequest = objectStore.delete(key);
             objectStoreRequest.onsuccess = _ => {
-                console.log(`Request successful. Deleted key: ${key}`);
                 resolve();
             };
             objectStoreRequest.onerror = e => reject(e);
@@ -152,7 +154,6 @@ class PersistentStorage {
                 'auto_accept': false
             });
             objectStoreRequest.onsuccess = e => {
-                console.log(`Request successful. RoomSecret added: ${e.target.result}`);
                 resolve();
             }
             objectStoreRequest.onerror = e => reject(e);
@@ -166,7 +167,6 @@ class PersistentStorage {
             for (let i = 0; i < roomSecrets.length; i++) {
                 secrets.push(roomSecrets[i].secret);
             }
-            console.log(`Request successful. Retrieved ${secrets.length} room_secrets`);
             return(secrets);
         } catch (e) {
             console.error("Could not retrieve room secrets", e);
@@ -191,13 +191,11 @@ class PersistentStorage {
             objectStoreRequestKey.onsuccess = e => {
                 const key = e.target.result;
                 if (!key) {
-                    console.log(`Nothing to retrieve. Entry for room_secret not existing: ${roomSecret}`);
                     resolve();
                     return;
                 }
                 const objectStoreRequestRetrieval = objectStore.get(key);
                 objectStoreRequestRetrieval.onsuccess = e => {
-                    console.log(`Request successful. Retrieved entry for room_secret: ${key}`);
                     resolve({
                         "entry": e.target.result,
                         "key": key
@@ -214,14 +212,12 @@ class PersistentStorage {
             const objectStoreRequestKey = objectStore.index("secret").getKey(roomSecret);
             objectStoreRequestKey.onsuccess = e => {
                 if (!e.target.result) {
-                    console.log(`Nothing to delete. room_secret not existing: ${roomSecret}`);
                     resolve();
                     return;
                 }
                 const key = e.target.result;
                 const objectStoreRequestDeletion = objectStore.delete(key);
                 objectStoreRequestDeletion.onsuccess = _ => {
-                    console.log(`Request successful. Deleted room_secret: ${key}`);
                     resolve(roomSecret);
                 }
                 objectStoreRequestDeletion.onerror = e => reject(e);
@@ -234,7 +230,6 @@ class PersistentStorage {
         return this._withObjectStore('room_secrets', 'readwrite', (objectStore, resolve, reject) => {
             const objectStoreRequest = objectStore.clear();
             objectStoreRequest.onsuccess = _ => {
-                console.log('Request successful. All room_secrets cleared');
                 resolve();
             };
             objectStoreRequest.onerror = e => reject(e);
@@ -266,7 +261,6 @@ class PersistentStorage {
                     const objectStoreRequestUpdate = objectStore.put(updatedRoomSecretEntry, roomSecretEntry.key);
 
                     objectStoreRequestUpdate.onsuccess = _ => {
-                        console.log(`Request successful. Updated room_secret: ${roomSecretEntry.key}`);
                         resolve({
                             "entry": updatedRoomSecretEntry,
                             "key": roomSecretEntry.key

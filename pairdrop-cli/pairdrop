@@ -121,7 +121,9 @@ sendFiles()
 {
   params="base64zip=hash"
   workingDir="$(pwd)"
-  tmpDir="/tmp/pairdrop-cli-temp/"
+  # unpredictable private temp dir (it contains the files to send)
+  tmpDir="$(mktemp -d)"
+  trap 'rm -rf "$tmpDir"' EXIT
   tmpDirPS="\$env:TEMP/pairdrop-cli-temp/"
   
   index=0
@@ -131,13 +133,6 @@ sendFiles()
   directoryCount=0
   fileCount=0
   pathsPS=""
-
-  #create tmp folder if it does not exist already (private: it contains the files to send)
-  if [[ ! -d "$tmpDir" ]]; then
-    mkdir -m 700 "$tmpDir"
-  else
-    chmod 700 "$tmpDir" 2>/dev/null
-  fi
 
   for arg in "$@"; do
    echo "$arg"
@@ -188,8 +183,8 @@ sendFiles()
       # remove all special characters
       zipName=${baseNameTrunk//[^a-zA-Z0-9_]/}
       
-      zipToSendAbs="${tmpDir}${zipName}_pairdrop.zip"
-      wrapperZipAbs="${tmpDir}${zipName}_pairdrop_wrapper.zip"
+      zipToSendAbs="${tmpDir}/${zipName}_pairdrop.zip"
+      wrapperZipAbs="${tmpDir}/${zipName}_pairdrop_wrapper.zip"
 
       if [[ $OS == "Windows" ]];then
         zipToSendAbsPS="${tmpDirPS}${zipName}_pairdrop.zip"
@@ -303,9 +298,9 @@ sendFiles()
           exit 1
       fi
       # Workaround to prevent use of Pipe which has a max letter limit
-      echo -n "$hash" > /tmp/pairdrop-cli-temp/pairdrop_hash_temp
-      wl-copy < /tmp/pairdrop-cli-temp/pairdrop_hash_temp
-      rm /tmp/pairdrop-cli-temp/pairdrop_hash_temp
+      echo -n "$hash" > "$tmpDir/pairdrop_hash_temp"
+      wl-copy < "$tmpDir/pairdrop_hash_temp"
+      rm "$tmpDir/pairdrop_hash_temp"
     else
       # X11
       if ! command -v xclip &> /dev/null; then

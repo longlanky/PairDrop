@@ -23,4 +23,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 USER node
 
-ENTRYPOINT ["npm", "start"]
+# Run node directly (not via npm) so signals reach the process and it can shut down gracefully.
+# Add runtime flags here, e.g. ["node", "server/index.js", "--rate-limit", "--auto-restart"].
+CMD ["node", "server/index.js"]

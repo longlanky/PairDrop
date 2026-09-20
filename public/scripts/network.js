@@ -251,7 +251,7 @@ class ServerConnection {
             case 'display-name-changed':
             case 'ws-chunk':
                 // ws-fallback
-                if (this._wsConfig.wsFallback) {
+                if (this._wsConfig && this._wsConfig.wsFallback) {
                     Events.fire('ws-relay', JSON.stringify(msg));
                 }
                 else {
@@ -402,7 +402,7 @@ class Peer {
     _send(message) {}
 
     sendDisplayName(displayName) {
-        this.sendJSON({type: 'display-name-changed', displayName: displayName});
+        this.sendJSON({type: 'display-name-changed', displayName: (displayName || '').substring(0, 100)});
     }
 
     _isSameBrowser() {
@@ -554,8 +554,20 @@ class Peer {
         });
         this._chunker = new FileChunker(file,
             chunk => this._send(chunk),
-            offset => this._onPartitionEnd(offset));
+            offset => this._onPartitionEnd(offset),
+            _ => this._onChunkerError());
         this._chunker.nextPartition();
+    }
+
+    _onChunkerError() {
+        // without this the transfer stalls silently: neither `partition` nor
+        // `file-transfer-complete` would ever arrive
+        this._chunker = null;
+        this._filesQueue = [];
+        this._filesRequested = null;
+        this._busy = false;
+        Events.fire('set-progress', {peerId: this._peerId, progress: 1, status: 'wait'});
+        Events.fire('notify-user', Localization.getTranslation("notifications.files-incorrect"));
     }
 
     _onPartitionEnd(offset) {
@@ -580,7 +592,14 @@ class Peer {
             this._onChunkReceived(message);
             return;
         }
-        const messageJSON = JSON.parse(message);
+        let messageJSON;
+        try {
+            messageJSON = JSON.parse(message);
+        } catch (e) {
+            // a peer can send arbitrary strings over the RTC data channel
+            console.warn('RTC receive: malformed message. Dropped.', e);
+            return;
+        }
         switch (messageJSON.type) {
             case 'request':
                 this._onFilesTransferRequest(messageJSON);
@@ -773,13 +792,17 @@ class Peer {
     }
 
     _onDisplayNameChanged(message) {
-        const displayNameHasChanged = this._displayName !== message.displayName
+        // display names are peer controlled: cap the length before using them in the UI
+        const displayName = typeof message.displayName === 'string'
+            ? message.displayName.substring(0, 100)
+            : '';
+        const displayNameHasChanged = this._displayName !== displayName
 
-        if (message.displayName && displayNameHasChanged) {
-            this._displayName = message.displayName;
+        if (displayName && displayNameHasChanged) {
+            this._displayName = displayName;
         }
 
-        Events.fire('peer-display-name-changed', {peerId: this._peerId, displayName: message.displayName});
+        Events.fire('peer-display-name-changed', {peerId: this._peerId, displayName: displayName});
 
         if (!displayNameHasChanged) return;
         Events.fire('notify-peer-display-name-changed', this._peerId);
@@ -890,7 +913,12 @@ class RTCPeer extends Peer {
 
     _onMessage(message) {
         if (typeof message === 'string') {
-            console.log('RTC:', JSON.parse(message));
+            try {
+                console.log('RTC:', JSON.parse(message));
+            } catch (e) {
+                console.warn('RTC: could not parse message for logging. Dropped.', e);
+                return;
+            }
         }
         super._onMessage(message);
     }
@@ -1139,9 +1167,10 @@ class PeersManager {
         }
 
         if (window.isRtcSupported && rtcSupported) {
-            this.peers[peerId] = new RTCPeer(this._server, isCaller, peerId, roomType, roomId, this._wsConfig.rtcConfig);
+            this.peers[peerId] = new RTCPeer(this._server, isCaller, peerId, roomType, roomId,
+                this._wsConfig && this._wsConfig.rtcConfig);
         }
-        else if (this._wsConfig.wsFallback) {
+        else if (this._wsConfig && this._wsConfig.wsFallback) {
             this.peers[peerId] = new WSPeer(this._server, isCaller, peerId, roomType, roomId);
         }
         else {
@@ -1161,7 +1190,7 @@ class PeersManager {
     }
 
     _onWsRelay(message) {
-        if (!this._wsConfig.wsFallback) return;
+        if (!this._wsConfig || !this._wsConfig.wsFallback) return;
 
         let messageJSON;
         try {
@@ -1351,7 +1380,7 @@ class PeersManager {
 
 class FileChunker {
 
-    constructor(file, onChunk, onPartitionEnd) {
+    constructor(file, onChunk, onPartitionEnd, onError) {
         this._chunkSize = 64000; // 64 KB
         this._maxPartitionSize = 1e6; // 1 MB
         this._offset = 0;
@@ -1359,6 +1388,7 @@ class FileChunker {
         this._file = file;
         this._onChunk = onChunk;
         this._onPartitionEnd = onPartitionEnd;
+        this._onError = onError;
         this._reader = new FileReader();
         this._reader.addEventListener('load', e => this._onChunkRead(e.target.result));
         // without these handlers a failing read stalls the transfer silently
@@ -1368,6 +1398,7 @@ class FileChunker {
 
     _onChunkError(e) {
         console.error('FileChunker: could not read chunk', e);
+        if (this._onError) this._onError(e);
     }
 
     nextPartition() {

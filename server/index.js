@@ -4,18 +4,6 @@ import fs from "fs";
 import PairDropServer from "./server.js";
 import PairDropWsServer from "./ws-server.js";
 
-// Handle SIGINT
-process.on('SIGINT', () => {
-    console.info("SIGINT Received, exiting...")
-    process.exit(0)
-})
-
-// Handle SIGTERM
-process.on('SIGTERM', () => {
-    console.info("SIGTERM Received, exiting...")
-    process.exit(0)
-})
-
 // Evaluate arguments for deployment with Docker and Node.js
 let conf = {};
 
@@ -86,8 +74,8 @@ conf.rateLimit = rateLimit;
 
 // `RATE_LIMIT` only enables rate limiting. The number of requests and the window
 // are configured separately so that `RATE_LIMIT` cannot be mistaken for hop count.
-conf.rateLimitMax = parseInt(process.env.RATE_LIMIT_MAX) || 1000;
-conf.rateLimitWindowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 5 * 60 * 1000;
+conf.rateLimitMax = parsePositiveIntEnv(process.env.RATE_LIMIT_MAX, 1000);
+conf.rateLimitWindowMs = parsePositiveIntEnv(process.env.RATE_LIMIT_WINDOW_MS, 5 * 60 * 1000);
 
 // Number of reverse proxy hops that are trusted to determine the client ip.
 // Tri-state: `true` trusts all hops (not recommended), `false`/`0` trusts none
@@ -181,21 +169,45 @@ if (conf.debugMode) {
 // Start server to serve client files
 const pairDropServer = new PairDropServer(conf);
 
+let pairDropWsServer = null;
 if (!conf.signalingServer) {
     // Start websocket server if SIGNALING_SERVER is not set
-    new PairDropWsServer(pairDropServer.server, conf);
+    pairDropWsServer = new PairDropWsServer(pairDropServer.server, conf);
 } else {
     console.log("This instance does not include a signaling server. Clients on this instance connect to the following signaling server:", conf.signalingServer);
 }
 
 console.log('\nPairDrop is running on port', conf.port);
 
+// Graceful shutdown: stop accepting connections and drain before exiting.
+// A hard exit is forced after a timeout so a stuck client cannot block restarts.
+let shuttingDown = false;
+function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.info(`${signal} received, shutting down...`);
+
+    if (pairDropWsServer) pairDropWsServer.close();
+
+    pairDropServer.server.close(() => process.exit(0));
+    if (pairDropServer.server.closeIdleConnections) {
+        pairDropServer.server.closeIdleConnections();
+    }
+    setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
 function parseTrustProxy(value) {
     if (value === undefined) {
         // Unset: keep the previous default (1 hop when rate limiting, else no trust)
         return undefined;
     }
-    if (value === "true") return true;
+    if (value === "true") {
+        console.warn("TRUST_PROXY=true trusts every reverse proxy hop. Clients can spoof their IP address; prefer an explicit hop count or `false`.");
+        return true;
+    }
     if (value === "false") return false;
 
     const parsed = parseInt(value);
@@ -203,6 +215,11 @@ function parseTrustProxy(value) {
 
     console.error(`TRUST_PROXY: "${value}" is not a valid value. Use true, false or a non-negative integer. Falling back to the default.`);
     return undefined;
+}
+
+function parsePositiveIntEnv(value, fallback) {
+    const parsed = parseInt(value);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function parseRtcConfig(path) {

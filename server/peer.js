@@ -46,6 +46,16 @@ export default class Peer {
         return false;
     }
 
+    messageRateReached(limitPerSecond = 50) {
+        // sliding second window: cap cheap-to-send control messages
+        const now = Date.now();
+        if (!this._messageRate || now - this._messageRate.start >= 1000) {
+            this._messageRate = { start: now, count: 0 };
+        }
+        this._messageRate.count += 1;
+        return this._messageRate.count > limitPerSecond;
+    }
+
     _setIP(request) {
         // Forwarded headers are client controlled. They are honored unless
         // TRUST_PROXY is explicitly set to false (instances exposed directly).

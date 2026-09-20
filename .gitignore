@@ -4,4 +4,5 @@ node_modules
 qrcode-svg/
 turnserver.conf
 rtc_config.json
+ecosystem.config.cjs
 ssl/

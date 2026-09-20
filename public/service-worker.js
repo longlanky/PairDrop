@@ -95,12 +95,16 @@ const fromNetwork = (request, timeout) =>
                 }
 
                 clearTimeout(timeoutId);
+
+                // Clone before the body is handed to the browser so the cached
+                // copy reuses this response instead of fetching the same url again.
+                const responseForCache = response.clone();
                 resolve(response);
 
                 // Prevent requests that are in relativePathsNotToCache from being cached
                 if (doNotCacheRequest(request)) return;
 
-                updateCache(request)
+                updateCache(request, responseForCache)
                     .then(() => console.log("Cache successfully updated for", request.url))
                     .catch(err => console.log("Cache could not be updated for", request.url, err));
             })
@@ -128,23 +132,15 @@ const doNotCacheRequest = request => {
 };
 
 // cache the current page to make it available for offline
-const updateCache = request => new Promise((resolve, reject) => {
+const updateCache = (request, response) =>
     caches
         .open(cacheTitle)
-        .then(cache =>
-            fetch(request, {cache: "no-store"})
-                .then(response => {
-                    if (response.redirected) {
-                        throw new Error("Fetch is redirect. Abort usage and cache!");
-                    }
-
-                    cache
-                        .put(request, response)
-                        .then(() => resolve());
-                })
-                .catch(reason => reject(reason))
-        );
-});
+        .then(cache => {
+            if (response.redirected) {
+                throw new Error("Fetch is redirect. Abort usage and cache!");
+            }
+            return cache.put(request, response);
+        });
 
 // general strategy when making a request:
 // 1. Try to retrieve file from cache
